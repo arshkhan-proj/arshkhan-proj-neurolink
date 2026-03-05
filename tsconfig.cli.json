@@ -15,6 +15,6 @@
       "*": ["src/types/*"]
     }
   },
-  "include": ["src/cli/**/*.ts", "src/lib/**/*.ts"],
+  "include": ["src/cli/**/*.ts", "src/lib/**/*.ts", "src/sandbox/**/*.ts"],
   "exclude": ["test", "**/*.test.ts", "**/*.spec.ts", "node_modules", "dist"]
 }

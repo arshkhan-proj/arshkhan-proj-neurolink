@@ -117,7 +117,12 @@
     "quality:report": "pnpm run quality:metrics && echo 'Quality metrics saved to quality-metrics.json'",
     "pre-commit": "lint-staged",
     "pre-push": "pnpm run validate:commit && pnpm run validate:env && pnpm run validate && pnpm run test",
-    "check:all": "pnpm run lint && pnpm run format --check && pnpm run validate && pnpm run validate:commit"
+    "check:all": "pnpm run lint && pnpm run format --check && pnpm run validate && pnpm run validate:commit",
+    "// Snapshot (frozen base + instance for sandbox)": "",
+    "snapshot:create-base": "bash scripts/snapshot/create-base.sh",
+    "snapshot:instance": "bash scripts/snapshot/instance-from-base.sh",
+    "snapshot:sync": "bash scripts/snapshot/sync-to-instance.sh",
+    "snapshot:run": "bash scripts/snapshot/run-instance.sh"
   },
   "files": [
     "dist",
@@ -213,6 +218,7 @@
     "p-limit": "^6.2.0",
     "pdf-parse": "^2.4.5",
     "pdf-to-img": "^5.0.0",
+    "pidusage": "^3.0.2",
     "pptxgenjs": "^3.12.0",
     "reconnecting-eventsource": "^1.6.4",
     "redis": "^5.8.2",
@@ -231,21 +237,21 @@
     "@opentelemetry/sdk-trace-node": "^2.0.0"
   },
   "optionalDependencies": {
-    "@hono/node-server": "^1.13.0",
-    "canvas": "^3.2.0",
-    "express-rate-limit": "^7.4.0",
-    "ffmpeg-static": "^5.3.0",
-    "ffprobe-static": "^3.1.0",
-    "sharp": "^0.34.5",
-    "@fastify/rate-limit": "^10.3.0",
-    "fastify": "^5.7.2",
     "@fastify/cors": "^11.2.0",
+    "@fastify/rate-limit": "^10.3.0",
+    "@hono/node-server": "^1.13.0",
     "@koa/cors": "^5.0.0",
     "@koa/router": "^15.3.0",
+    "canvas": "^3.2.0",
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "express-rate-limit": "^7.4.0",
+    "fastify": "^5.7.2",
+    "ffmpeg-static": "^5.3.0",
+    "ffprobe-static": "^3.1.0",
     "koa": "^3.1.1",
     "koa-bodyparser": "^4.4.1",
-    "express": "^5.1.0",
-    "cors": "^2.8.5"
+    "sharp": "^0.34.5"
   },
   "devDependencies": {
     "@actions/core": "^2.0.2",
@@ -278,6 +284,7 @@
     "@types/koa-bodyparser": "^4.3.13",
     "@types/koa__cors": "^5.0.1",
     "@types/node": "^20.19.13",
+    "@types/pidusage": "^2.0.5",
     "@types/tar-stream": "^3.1.4",
     "@types/ws": "^8.18.1",
     "@types/xml2js": "^0.4.14",

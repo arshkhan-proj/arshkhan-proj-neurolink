@@ -10,6 +10,7 @@ import { SetupCommandFactory } from "./factories/setupCommandFactory.js";
 import { ServerCommandFactory } from "./commands/server.js";
 import { ServeCommandFactory } from "./commands/serve.js";
 import { ragCommand } from "./commands/rag.js";
+import { sandboxCommand } from "./commands/sandbox.js";
 
 // Enhanced CLI with Professional UX
 export function initializeCliParser() {
@@ -206,5 +207,8 @@ export function initializeCliParser() {
 
       // RAG Document Processing Commands
       .command(ragCommand)
+
+      // Sandbox Execution Command
+      .command(sandboxCommand)
   ); // Close the main return statement
 }
