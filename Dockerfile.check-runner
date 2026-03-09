@@ -1,0 +1,32 @@
+FROM node:20-bullseye
+
+# 1. Workdir
+WORKDIR /app
+
+# 2. Enable pnpm via corepack
+RUN corepack enable
+
+# 3. Copy package metadata first (for caching)
+COPY package.json pnpm-lock.yaml ./
+
+# 4. Install deps
+RUN pnpm install --frozen-lockfile
+
+# 5. Copy full source
+COPY . .
+
+# 6. Build CLI only
+RUN NODE_OPTIONS="--max_old_space_size=2048" pnpm run build:cli
+
+# 7. Ensure script is executable
+RUN chmod +x /app/run-sandbox-checks.sh
+
+# 8. Expose port
+EXPOSE 4000
+
+# 9. Default env
+ENV CHECK_RUNNER_SECRET=change-me
+ENV PORT=4000
+
+# 10. Start HTTP check runner
+CMD ["node", "check-runner.js"]

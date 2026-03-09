@@ -49,9 +49,7 @@ function parseEnvVariables(
     const value = pair.slice(index + 1).trim();
     if (!key) {
       process.stderr.write(
-        chalk.yellow(
-          `Ignoring invalid --env entry with empty key: ${pair}\n`,
-        ),
+        chalk.yellow(`Ignoring invalid --env entry with empty key: ${pair}\n`),
       );
       continue;
     }
@@ -174,4 +172,3 @@ export const sandboxCommand: CommandModule<unknown, SandboxCommandArgs> = {
     }
   },
 };
-

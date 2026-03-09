@@ -14,4 +14,3 @@ export interface SandboxResult {
   stderr: string;
   durationMs: number;
 }
-
