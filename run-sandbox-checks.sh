@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /app
+# WORK_DIR is passed from the Node server; default to /app if missing
+WORK_DIR="${WORK_DIR:-/app}"
 
-node dist/cli/index.js sandbox \
+cd "$WORK_DIR"
+
+# Run Neurolink CLI sandbox checks against this snapshot dir
+node /app/dist/cli/index.js sandbox \
   --cmd "pnpm lint && pnpm test" \
-  --cwd /app \
+  --cwd "$WORK_DIR" \
   --timeout 3600000 \
   --env NODE_ENV=test
