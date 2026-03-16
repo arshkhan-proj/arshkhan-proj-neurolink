@@ -1,43 +1,74 @@
-import http from 'node:http';
-import { exec } from 'node:child_process';
+import http from "node:http";
+import { exec } from "node:child_process";
+import { pullSnapshot } from "./pullSnapshot.js";
 
 const PORT = process.env.PORT || 4000;
 
 const server = http.createServer((req, res) => {
-  if (req.method !== 'POST' || req.url !== '/run-checks') {
+  if (req.method !== "POST" || req.url !== "/run-checks") {
     res.writeHead(404);
-    return res.end('Not found');
+    return res.end("Not found");
   }
 
-  let body = '';
-  req.on('data', (chunk) => {
+  let body = "";
+  req.on("data", (chunk) => {
     body += chunk;
   });
 
-  req.on('end', () => {
-    let parsed;
+  req.on("end", async () => {
+    /** @type {{ workDir?: string; snapshotId?: string; commands?: unknown[] }} */
+    let parsed = {};
     try {
       parsed = body ? JSON.parse(body) : {};
     } catch {
       res.writeHead(400);
-      return res.end('Invalid JSON');
+      return res.end("Invalid JSON");
     }
 
-    const workDir = typeof parsed.workDir === 'string' ? parsed.workDir : '';
+    const snapshotId =
+      typeof parsed.snapshotId === "string" && parsed.snapshotId.trim() !== ""
+        ? parsed.snapshotId.trim()
+        : undefined;
+
+    let workDir =
+      typeof parsed.workDir === "string" && parsed.workDir.trim() !== ""
+        ? parsed.workDir.trim()
+        : "";
+
+    // If snapshotId is provided, ignore incoming workDir and pull snapshot
+    if (snapshotId) {
+      try {
+        workDir = await pullSnapshot(snapshotId);
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            snapshotId,
+            error:
+              err instanceof Error
+                ? err.message
+                : "Failed to pull snapshot from S3",
+          }),
+        );
+      }
+    }
+
     if (!workDir) {
       res.writeHead(400);
-      return res.end('workDir is required');
+      return res.end("workDir is required when snapshotId is not provided");
     }
 
     const commandsInput = parsed.commands;
     const commands =
       Array.isArray(commandsInput) && commandsInput.length > 0
-        ? commandsInput.filter((c) => typeof c === 'string' && c.trim() !== '')
-        : ['pnpm test'];
+        ? commandsInput.filter(
+            (c) => typeof c === "string" && c.trim() !== "",
+          )
+        : ["pnpm test"];
 
     if (commands.length === 0) {
       res.writeHead(400);
-      return res.end('commands must be a non-empty array of strings');
+      return res.end("commands must be a non-empty array of strings");
     }
 
     const runCommand = (command) =>
@@ -46,31 +77,30 @@ const server = http.createServer((req, res) => {
         exec(
           command,
           {
-            shell: '/bin/bash',
             cwd: workDir,
             env: {
               ...process.env,
-              NODE_ENV: 'test'
-            }
+              NODE_ENV: "test",
+            },
           },
           (error, stdout, stderr) => {
             const durationMs = Date.now() - start;
             const success = !error;
             const exitCode =
-              error && typeof error.code === 'number' ? error.code : 0;
+              error && typeof error.code === "number" ? error.code : 0;
             resolve({
               command,
               success,
               exitCode,
               durationMs,
               stdout,
-              stderr
+              stderr,
             });
-          }
+          },
         );
       });
 
-    (async () => {
+    try {
       const results = [];
       for (const cmd of commands) {
         // Run sequentially so commands can depend on previous steps
@@ -82,23 +112,25 @@ const server = http.createServer((req, res) => {
 
       const allSuccess = results.every((r) => r.success);
       res.writeHead(allSuccess ? 200 : 500, {
-        'Content-Type': 'application/json'
+        "Content-Type": "application/json",
       });
       res.end(
         JSON.stringify({
+          snapshotId,
           workDir,
-          results
-        })
+          results,
+        }),
       );
-    })().catch((err) => {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
+          snapshotId,
           workDir,
-          error: err instanceof Error ? err.message : 'Unknown error'
-        })
+          error: err instanceof Error ? err.message : "Unknown error",
+        }),
       );
-    });
+    }
   });
 });
 
