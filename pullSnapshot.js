@@ -9,12 +9,8 @@ import { exec as execCb } from "node:child_process";
 const pipe = promisify(pipeline);
 const exec = promisify(execCb);
 
-const {
-  S3_BUCKET,
-  S3_BASE_PATH,
-  S3_EXTRA_PATH,
-  AWS_REGION = "ap-south-1",
-} = process.env;
+const { S3_BUCKET, S3_BASE_PATH, S3_EXTRA_PATH, AWS_REGION = "ap-south-1" } =
+  process.env;
 
 if (!S3_BUCKET || !S3_BASE_PATH || !S3_EXTRA_PATH) {
   throw new Error(
@@ -28,15 +24,21 @@ const s3 = new S3Client({ region: AWS_REGION });
  * Download and extract a snapshot tarball from S3.
  * Returns the local directory path containing the extracted snapshot.
  *
- * @param {string} snapshotId e.g. lighthouse-snapshot-<git-commit>.tar.gz
+ * @param {string} snapshotId e.g. <repo>-snapshot-<git-commit>.tar.gz
+ * @param {string | undefined} repoName name of the repo (used as base path), e.g. "lighthouse"
  * @returns {Promise<string>} local directory to use as workDir
  */
-export async function pullSnapshot(snapshotId) {
+export async function pullSnapshot(snapshotId, repoName) {
   if (!snapshotId || typeof snapshotId !== "string") {
     throw new Error("snapshotId must be a non-empty string");
   }
 
-  const prefix = `${S3_BASE_PATH}/${S3_EXTRA_PATH}/snapshots/`.replace(
+  const effectiveBasePath =
+    typeof repoName === "string" && repoName.trim() !== ""
+      ? repoName.trim()
+      : S3_BASE_PATH;
+
+  const prefix = `${effectiveBasePath}/${S3_EXTRA_PATH}/snapshots/`.replace(
     /\/+/g,
     "/",
   );

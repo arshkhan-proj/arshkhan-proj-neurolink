@@ -16,7 +16,14 @@ const server = http.createServer((req, res) => {
   });
 
   req.on("end", async () => {
-    /** @type {{ workDir?: string; snapshotId?: string; commands?: unknown[] }} */
+    /**
+     * @type {{
+     *   workDir?: string;
+     *   snapshotId?: string;
+     *   repoName?: string;
+     *   commands?: unknown[];
+     * }}
+     */
     let parsed = {};
     try {
       parsed = body ? JSON.parse(body) : {};
@@ -30,6 +37,11 @@ const server = http.createServer((req, res) => {
         ? parsed.snapshotId.trim()
         : undefined;
 
+    const repoName =
+      typeof parsed.repoName === "string" && parsed.repoName.trim() !== ""
+        ? parsed.repoName.trim()
+        : undefined;
+
     let workDir =
       typeof parsed.workDir === "string" && parsed.workDir.trim() !== ""
         ? parsed.workDir.trim()
@@ -38,12 +50,13 @@ const server = http.createServer((req, res) => {
     // If snapshotId is provided, ignore incoming workDir and pull snapshot
     if (snapshotId) {
       try {
-        workDir = await pullSnapshot(snapshotId);
+        workDir = await pullSnapshot(snapshotId, repoName);
       } catch (err) {
         res.writeHead(500, { "Content-Type": "application/json" });
         return res.end(
           JSON.stringify({
             snapshotId,
+            repoName,
             error:
               err instanceof Error
                 ? err.message
@@ -117,6 +130,7 @@ const server = http.createServer((req, res) => {
       res.end(
         JSON.stringify({
           snapshotId,
+          repoName,
           workDir,
           results,
         }),
