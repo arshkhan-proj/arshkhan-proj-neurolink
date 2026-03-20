@@ -16,9 +16,15 @@ const {
   S3_EXTRA_PATH,
   AWS_REGION = "ap-south-1",
   GCP_BUCKET_NAME,
+  GCP_BUCKET_NAME_RELEASE,
   GCS_BASE_PATH,
   GCS_EXTRA_PATH,
 } = process.env;
+
+const getGcsBucketName = () =>
+  (GCP_BUCKET_NAME_RELEASE && GCP_BUCKET_NAME_RELEASE.trim()) ||
+  (GCP_BUCKET_NAME && GCP_BUCKET_NAME.trim()) ||
+  "";
 
 const normalizeKeyPrefix = (p) => p.replace(/\/+/g, "/");
 
@@ -34,7 +40,11 @@ const resolveSnapshotProvider = () => {
   }
 
   // Auto-detect: prefer GCS when configured, otherwise fall back to S3.
-  const hasGcsConfig = !!(GCP_BUCKET_NAME && GCS_BASE_PATH && GCS_EXTRA_PATH);
+  const hasGcsConfig = !!(
+    getGcsBucketName() &&
+    GCS_BASE_PATH &&
+    GCS_EXTRA_PATH
+  );
   const hasS3Config = !!(S3_BUCKET && S3_BASE_PATH && S3_EXTRA_PATH);
 
   if (hasGcsConfig) {
@@ -71,14 +81,14 @@ export async function pullSnapshot(snapshotId, repoName) {
   const provider = resolveSnapshotProvider();
   if (provider === "unknown") {
     throw new Error(
-      "Snapshot storage provider not configured. Set GCP_BUCKET_NAME/GCS_BASE_PATH/GCS_EXTRA_PATH (preferred) or S3_BUCKET/S3_BASE_PATH/S3_EXTRA_PATH.",
+      "Snapshot storage provider not configured. Set GCP_BUCKET_NAME_RELEASE/GCS_BASE_PATH/GCS_EXTRA_PATH (preferred) or S3_BUCKET/S3_BASE_PATH/S3_EXTRA_PATH.",
     );
   }
 
   if (provider === "gcs") {
-    if (!GCP_BUCKET_NAME || !GCS_BASE_PATH || !GCS_EXTRA_PATH) {
+    if (!getGcsBucketName() || !GCS_BASE_PATH || !GCS_EXTRA_PATH) {
       throw new Error(
-        "Missing GCS configuration. Set GCP_BUCKET_NAME, GCS_BASE_PATH, and GCS_EXTRA_PATH.",
+        "Missing GCS configuration. Set GCP_BUCKET_NAME_RELEASE (preferred), GCS_BASE_PATH, and GCS_EXTRA_PATH.",
       );
     }
   } else {
@@ -105,13 +115,14 @@ export async function pullSnapshot(snapshotId, repoName) {
   const writeStream = createWriteStream(archivePath);
 
   if (provider === "gcs") {
-    if (!GCP_BUCKET_NAME) {
-      throw new Error("GCP_BUCKET_NAME must be set for GCS pulls");
+    const gcsBucketName = getGcsBucketName();
+    if (!gcsBucketName) {
+      throw new Error("GCP_BUCKET_NAME_RELEASE must be set for GCS pulls");
     }
 
     const storage = new Storage();
     const readStream = storage
-      .bucket(GCP_BUCKET_NAME)
+      .bucket(gcsBucketName)
       .file(key)
       .createReadStream();
     await pipe(readStream, writeStream);
