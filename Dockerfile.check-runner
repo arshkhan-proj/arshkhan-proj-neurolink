@@ -12,21 +12,25 @@ COPY package.json pnpm-lock.yaml ./
 # 4. Install deps
 RUN pnpm install --frozen-lockfile
 
-# 5. Copy full source
+# 5. Runtime dep for snapshot pulls (used by pullSnapshot.js)
+RUN npm install --no-save @google-cloud/storage@^7.19.0
+
+# 6. Copy full source
 COPY . .
 
-# 6. Build CLI only
+# 7. Build CLI only
 RUN NODE_OPTIONS="--max_old_space_size=2048" pnpm run build:cli
 
-# 7. Ensure script is executable
+# 8. Ensure script is executable
 RUN chmod +x /app/run-sandbox-checks.sh
 
-# 8. Expose port
+# 9. Expose port
 EXPOSE 4000
 
-# 9. Default env
+# 10. Default env
 ENV CHECK_RUNNER_SECRET=change-me
 ENV PORT=4000
 
-# 10. Start HTTP check runner
+# 11. Start HTTP check runner
 CMD ["node", "check-runner.js"]
+

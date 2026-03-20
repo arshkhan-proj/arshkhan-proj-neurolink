@@ -60,7 +60,7 @@ const server = http.createServer((req, res) => {
             error:
               err instanceof Error
                 ? err.message
-                : "Failed to pull snapshot from S3",
+                : "Failed to pull snapshot from configured storage",
           }),
         );
       }
@@ -74,9 +74,7 @@ const server = http.createServer((req, res) => {
     const commandsInput = parsed.commands;
     const commands =
       Array.isArray(commandsInput) && commandsInput.length > 0
-        ? commandsInput.filter(
-            (c) => typeof c === "string" && c.trim() !== "",
-          )
+        ? commandsInput.filter((c) => typeof c === "string" && c.trim() !== "")
         : ["pnpm test"];
 
     if (commands.length === 0) {

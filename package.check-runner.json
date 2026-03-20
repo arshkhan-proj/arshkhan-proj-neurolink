@@ -1,0 +1,9 @@
+{
+  "name": "neurolink-check-runner",
+  "type": "module",
+  "description": "Minimal package for check-runner Docker image (S3/GCS snapshot pulls)",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.886.0",
+    "@google-cloud/storage": "^7.19.0"
+  }
+}
