@@ -1,51 +1,31 @@
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { Storage } from "@google-cloud/storage";
+import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { createReadStream, mkdirSync } from "node:fs";
+import { execFile as execFileCb } from "node:child_process";
+import { promisify } from "node:util";
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { exec as execCb } from "node:child_process";
-import { promisify } from "node:util";
+import {
+  resolveProvider,
+  storageKey,
+  s3,
+  s3Bucket,
+  gcs,
+  gcsBucketName,
+  removeFile,
+} from "./snapshotStorage.js";
 
-const exec = promisify(execCb);
+const execFile = promisify(execFileCb);
 
-const {
-  S3_BUCKET,
-  S3_BASE_PATH,
-  S3_EXTRA_PATH,
-  AWS_REGION = "ap-south-1",
-  GCP_BUCKET_NAME,
-  GCP_BUCKET_NAME_RELEASE,
-  GCS_BASE_PATH,
-  GCS_EXTRA_PATH,
-} = process.env;
+const UPLOAD_ROOT = path.join(os.tmpdir(), "neurolink-snapshots-upload");
 
-const getGcsBucketName = () =>
-  (GCP_BUCKET_NAME_RELEASE && GCP_BUCKET_NAME_RELEASE.trim()) ||
-  (GCP_BUCKET_NAME && GCP_BUCKET_NAME.trim()) ||
-  "";
-
-const normalizeKeyPrefix = (p) => p.replace(/\/+/g, "/");
-
-const resolveSnapshotProvider = () => {
-  const provider = process.env.SNAPSHOT_STORAGE_PROVIDER?.toLowerCase().trim();
-
-  if (provider === "gcp" || provider === "gcs") return "gcs";
-  if (provider === "aws" || provider === "s3") return "s3";
-
-  const hasGcsConfig = !!(
-    getGcsBucketName() &&
-    GCS_BASE_PATH &&
-    GCS_EXTRA_PATH
-  );
-  const hasS3Config = !!(S3_BUCKET && S3_BASE_PATH && S3_EXTRA_PATH);
-
-  if (hasGcsConfig) return "gcs";
-  if (hasS3Config) return "s3";
-  return "unknown";
-};
-
-const sanitizeSegment = (value) =>
-  value.replace(/[^a-zA-Z0-9_.-]/g, "-").replace(/-+/g, "-");
+/**
+ * @param {string} value
+ * @returns {string}
+ */
+function sanitize(value) {
+  return value.replace(/[^a-zA-Z0-9_.-]/g, "-").replace(/-+/g, "-");
+}
 
 /**
  * @typedef {{
@@ -56,10 +36,10 @@ const sanitizeSegment = (value) =>
  */
 
 /**
- * Package current workspace and push a full tar.gz snapshot to configured storage.
+ * Package workDir as a tarball and upload to S3 or GCS.
  *
  * @param {PushSnapshotOptions} options
- * @returns {Promise<{snapshotId: string; provider: "gcs" | "s3"; key: string}>}
+ * @returns {Promise<{ snapshotId: string; provider: "gcs" | "s3"; key: string }>}
  */
 export async function pushSnapshot(options) {
   const { workDir, repoName, parentSnapshotId } = options;
@@ -68,80 +48,45 @@ export async function pushSnapshot(options) {
     throw new Error("workDir must be a non-empty string");
   }
 
-  const provider = resolveSnapshotProvider();
-  if (provider === "unknown") {
-    throw new Error(
-      "Snapshot storage provider not configured for push. Set GCP_BUCKET_NAME_RELEASE/GCS_BASE_PATH/GCS_EXTRA_PATH (preferred) or S3_BUCKET/S3_BASE_PATH/S3_EXTRA_PATH.",
-    );
-  }
+  const provider = resolveProvider();
 
-  if (provider === "gcs") {
-    if (!getGcsBucketName() || !GCS_BASE_PATH || !GCS_EXTRA_PATH) {
-      throw new Error(
-        "Missing GCS configuration. Set GCP_BUCKET_NAME_RELEASE (preferred), GCS_BASE_PATH, and GCS_EXTRA_PATH.",
-      );
-    }
-  } else if (!S3_BUCKET || !S3_BASE_PATH || !S3_EXTRA_PATH) {
-    throw new Error(
-      "Missing S3 configuration. Set S3_BUCKET, S3_BASE_PATH, and S3_EXTRA_PATH.",
-    );
-  }
-
-  const repoSegment =
-    typeof repoName === "string" && repoName.trim() !== ""
-      ? sanitizeSegment(repoName.trim())
+  // Short, collision-resistant ID: repo-snapshot-<timestamp>-<8 hex chars>.tar.gz
+  const repo =
+    typeof repoName === "string" && repoName.trim()
+      ? sanitize(repoName.trim())
       : "repo";
-  const parentSegment =
-    typeof parentSnapshotId === "string" && parentSnapshotId.trim() !== ""
-      ? sanitizeSegment(parentSnapshotId.replace(/\.tar\.gz$/i, ""))
-      : "manual";
-  const snapshotId = `${repoSegment}-snapshot-${Date.now()}-${parentSegment}.tar.gz`;
+  const shortRand = crypto.randomBytes(4).toString("hex");
+  const snapshotId = `${repo}-snapshot-${Date.now()}-${shortRand}.tar.gz`;
 
-  const tmpRoot = path.join(os.tmpdir(), "neurolink-snapshots-upload");
-  mkdirSync(tmpRoot, { recursive: true });
-  const archivePath = path.join(tmpRoot, snapshotId);
+  mkdirSync(UPLOAD_ROOT, { recursive: true });
+  const archivePath = path.join(UPLOAD_ROOT, snapshotId);
 
-  await exec(`tar -czf "${archivePath}" -C "${workDir}" .`);
+  try {
+    // No shell — immune to injection via workDir.
+    await execFile("tar", ["-czf", archivePath, "-C", workDir, "."]);
 
-  const effectiveBasePath =
-    provider === "gcs"
-      ? GCS_BASE_PATH
-      : typeof repoName === "string" && repoName.trim() !== ""
-        ? repoName.trim()
-        : S3_BASE_PATH;
-  const extraPath = provider === "gcs" ? GCS_EXTRA_PATH : S3_EXTRA_PATH;
-  const prefix = normalizeKeyPrefix(
-    `${effectiveBasePath}/${extraPath}/snapshots/`,
-  );
-  const key = `${prefix}${snapshotId}`;
+    const key = storageKey(snapshotId, repoName);
 
-  if (provider === "gcs") {
-    const bucketName = getGcsBucketName();
-    if (!bucketName) {
-      throw new Error("GCP_BUCKET_NAME_RELEASE must be set for GCS pushes");
+    if (provider === "gcs") {
+      await gcs().bucket(gcsBucketName()).upload(archivePath, {
+        destination: key,
+        gzip: false,
+        contentType: "application/gzip",
+      });
+      return { snapshotId, provider: "gcs", key, parentSnapshotId: parentSnapshotId || null };
     }
 
-    const storage = new Storage();
-    await storage.bucket(bucketName).upload(archivePath, {
-      destination: key,
-      gzip: false,
-      contentType: "application/gzip",
-    });
-    return { snapshotId, provider: "gcs", key };
+    await s3().send(
+      new PutObjectCommand({
+        Bucket: s3Bucket(),
+        Key: key,
+        Body: createReadStream(archivePath),
+        ContentType: "application/gzip",
+      }),
+    );
+    return { snapshotId, provider: "s3", key, parentSnapshotId: parentSnapshotId || null };
+  } finally {
+    // Always clean up the local archive.
+    await removeFile(archivePath);
   }
-
-  if (!S3_BUCKET) {
-    throw new Error("S3_BUCKET must be set for S3 pushes");
-  }
-  const s3 = new S3Client({ region: AWS_REGION });
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: S3_BUCKET,
-      Key: key,
-      Body: createReadStream(archivePath),
-      ContentType: "application/gzip",
-    }),
-  );
-
-  return { snapshotId, provider: "s3", key };
 }

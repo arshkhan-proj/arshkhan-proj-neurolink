@@ -1,36 +1,33 @@
-FROM node:20-bullseye
+FROM node:20-bullseye-slim
 
-# 1. Workdir
 WORKDIR /app
 
-# 2. Enable pnpm via corepack
-RUN corepack enable
+# git is needed for `git apply` in editOperations.js (removed after each use).
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
-# 3. Copy package metadata first (for caching)
-COPY package.json pnpm-lock.yaml ./
+# Only the two runtime dependencies — no full project install.
+RUN npm init -y && \
+    npm install --save-exact @aws-sdk/client-s3@3.886.0 @google-cloud/storage@7.19.0
 
-# 4. Install deps
-RUN pnpm install --frozen-lockfile
+# Copy only the files the check-runner actually uses.
+COPY check-runner.js \
+     snapshotStorage.js \
+     pullSnapshot.js \
+     pushSnapshot.js \
+     editOperations.js \
+     ./
 
-# 5. Runtime dep for snapshot pulls (used by pullSnapshot.js)
-RUN npm install --no-save @google-cloud/storage@^7.19.0
+# Create a non-root user for running commands.
+# The server itself and all commands run as this user.
+RUN groupadd --gid 1001 runner && \
+    useradd --uid 1001 --gid 1001 --create-home runner && \
+    chown -R runner:runner /app /tmp
 
-# 6. Copy full source
-COPY . .
-
-# 7. Build CLI only
-RUN NODE_OPTIONS="--max_old_space_size=2048" pnpm run build:cli
-
-# 8. Ensure script is executable
-RUN chmod +x /app/run-sandbox-checks.sh
-
-# 9. Expose port
 EXPOSE 4000
 
-# 10. Default env
 ENV CHECK_RUNNER_SECRET=change-me
 ENV PORT=4000
 
-# 11. Start HTTP check runner
-CMD ["node", "check-runner.js"]
+USER runner
 
+CMD ["node", "check-runner.js"]

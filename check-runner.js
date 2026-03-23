@@ -1,371 +1,492 @@
 import http from "node:http";
 import { exec } from "node:child_process";
+import { promises as fs } from "node:fs";
+import crypto from "node:crypto";
 import { pullSnapshot } from "./pullSnapshot.js";
-import { applyEdits } from "./editOperations.js";
+import { applyDiff } from "./editOperations.js";
 import { pushSnapshot as pushSnapshotArtifact } from "./pushSnapshot.js";
 
-const PORT = process.env.PORT || 4000;
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+const PORT = Number(process.env.PORT || 4000);
+const AUTH_SECRET = process.env.CHECK_RUNNER_SECRET || "";
+const JOB_TTL_MS = Number(process.env.CHECK_RUNNER_JOB_TTL_MS || 3_600_000);
+const CLEANUP_INTERVAL_MS = Number(
+  process.env.CHECK_RUNNER_JOB_CLEANUP_INTERVAL_MS || 60_000,
+);
+const MAX_JOBS = Number(process.env.CHECK_RUNNER_MAX_JOBS || 500);
+const DEFAULT_TIMEOUT_MS = Number(
+  process.env.CHECK_RUNNER_COMMAND_TIMEOUT_MS || 600_000,
+);
+const MAX_BODY_BYTES = 5 * 1024 * 1024; // 5 MB
+const MAX_OUTPUT_BYTES = 100 * 1024; // 100 KB per stdout/stderr
 
-const ERROR_CODES = {
-  INVALID_REQUEST: "INVALID_REQUEST",
-  INVALID_JSON: "INVALID_JSON",
-  SNAPSHOT_PULL_FAILED: "SNAPSHOT_PULL_FAILED",
-  EDIT_FAILED: "EDIT_FAILED",
-  COMMAND_EXECUTION_FAILED: "COMMAND_EXECUTION_FAILED",
+// Env vars that commands are allowed to see.
+// Everything else (cloud credentials, auth secret) stays with the server.
+const COMMAND_ENV = Object.fromEntries(
+  [
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "LANG",
+    "TERM",
+    "TMPDIR",
+    "NODE_VERSION",
+    "HOSTNAME",
+    "npm_config_cache",
+    "PNPM_HOME",
+    "COREPACK_HOME",
+  ]
+    .filter((k) => process.env[k] !== undefined)
+    .map((k) => [k, process.env[k]]),
+);
+
+// ---------------------------------------------------------------------------
+// Error codes
+// ---------------------------------------------------------------------------
+const E = {
+  UNAUTHORIZED: "UNAUTHORIZED",
+  BAD_REQUEST: "BAD_REQUEST",
+  BAD_JSON: "BAD_JSON",
+  PULL_FAILED: "PULL_FAILED",
+  DIFF_FAILED: "DIFF_FAILED",
+  COMMAND_FAILED: "COMMAND_FAILED",
+  COMMAND_TIMEOUT: "COMMAND_TIMEOUT",
   PUSH_FAILED: "PUSH_FAILED",
-  INTERNAL_ERROR: "INTERNAL_ERROR",
+  INTERNAL: "INTERNAL",
 };
 
-const EDIT_TYPES = new Set([
-  "write_file",
-  "replace_in_file",
-  "delete_file",
-  "apply_patch",
-]);
+// ---------------------------------------------------------------------------
+// Job store
+// ---------------------------------------------------------------------------
+/** @type {Map<string, Record<string, unknown>>} */
+const jobs = new Map();
+/** @type {string[]} */
+const queue = [];
+let workerBusy = false;
 
-/**
- * @param {http.ServerResponse} res
- * @param {number} statusCode
- * @param {Record<string, unknown>} payload
- */
-function sendJson(res, statusCode, payload) {
-  res.writeHead(statusCode, { "Content-Type": "application/json" });
-  res.end(JSON.stringify(payload));
-}
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
 
 /**
  * @param {http.IncomingMessage} req
- * @returns {Promise<string>}
+ * @returns {boolean}
  */
-async function readBody(req) {
-  return await new Promise((resolve, reject) => {
-    let body = "";
+function isAuthorized(req) {
+  if (!AUTH_SECRET) return true; // no secret configured = open (dev mode)
+  const header = req.headers["authorization"] || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (token && token === AUTH_SECRET) return true;
+  const keyHeader = req.headers["x-api-key"];
+  if (typeof keyHeader === "string" && keyHeader === AUTH_SECRET) return true;
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP helpers
+// ---------------------------------------------------------------------------
+
+/** @param {http.ServerResponse} res */
+function json(res, status, body) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+/** @param {http.IncomingMessage} req */
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let bytes = 0;
     req.on("data", (chunk) => {
-      body += chunk;
+      bytes += chunk.length;
+      if (bytes > MAX_BODY_BYTES) {
+        req.destroy();
+        reject(new Error("Request body too large"));
+        return;
+      }
+      chunks.push(chunk);
     });
-    req.on("end", () => resolve(body));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString()));
     req.on("error", reject);
   });
 }
 
-/**
- * @param {string} body
- * @returns {Record<string, unknown>}
- */
-function parseJsonBody(body) {
-  if (!body || body.trim() === "") {
-    return {};
+/** @returns {Record<string, unknown>} */
+function parseJson(raw) {
+  if (!raw || raw.trim() === "") return {};
+  const obj = JSON.parse(raw);
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+    throw new Error("Body must be a JSON object");
   }
-  const parsed = JSON.parse(body);
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("Request body must be a JSON object");
-  }
-  return /** @type {Record<string, unknown>} */ (parsed);
+  return obj;
 }
 
+// ---------------------------------------------------------------------------
+// Input normalisation + validation (single pass)
+// ---------------------------------------------------------------------------
+
 /**
- * @param {Record<string, unknown>} parsed
- * @returns {{
+ * @param {Record<string, unknown>} raw
+ * @returns {{ ok: true; input: NormalizedInput } | { ok: false; reason: string }}
+ *
+ * @typedef {{
  *   snapshotId?: string;
  *   workDir?: string;
  *   repoName?: string;
+ *   diff?: string;
  *   commands: string[];
- *   edits: unknown[];
- * }}
+ *   pushSnapshot: boolean;
+ *   commandTimeoutMs: number;
+ * }} NormalizedInput
  */
-function normalizeRequest(parsed) {
-  const snapshotId =
-    typeof parsed.snapshotId === "string" && parsed.snapshotId.trim() !== ""
-      ? parsed.snapshotId.trim()
-      : undefined;
-
-  const repoName =
-    typeof parsed.repoName === "string" && parsed.repoName.trim() !== ""
-      ? parsed.repoName.trim()
-      : undefined;
-
-  const workDir =
-    typeof parsed.workDir === "string" && parsed.workDir.trim() !== ""
-      ? parsed.workDir.trim()
-      : undefined;
-
-  const commandsInput = parsed.commands;
-  const commands =
-    Array.isArray(commandsInput) && commandsInput.length > 0
-      ? commandsInput.filter((c) => typeof c === "string" && c.trim() !== "")
-      : ["pnpm test"];
-
-  const editsInput = parsed.edits;
-  const edits = Array.isArray(editsInput) ? editsInput : [];
-  const pushSnapshot = parsed.pushSnapshot === true;
-
-  return { snapshotId, workDir, repoName, commands, edits, pushSnapshot };
-}
-
-/**
- * @param {unknown[]} edits
- * @returns {{ valid: boolean; reason?: string }}
- */
-function validateEdits(edits) {
-  for (let i = 0; i < edits.length; i += 1) {
-    const edit = edits[i];
-    if (!edit || typeof edit !== "object" || Array.isArray(edit)) {
-      return { valid: false, reason: `edits[${i}] must be an object` };
-    }
-
-    const type = "type" in edit ? String(edit.type || "") : "";
-    if (!EDIT_TYPES.has(type)) {
-      return {
-        valid: false,
-        reason: `edits[${i}].type must be one of: ${[...EDIT_TYPES].join(", ")}`,
-      };
-    }
+function validateAndNormalize(raw) {
+  if ("diff" in raw && (typeof raw.diff !== "string" || !raw.diff.trim())) {
+    return { ok: false, reason: "diff must be a non-empty string" };
+  }
+  if ("commands" in raw && !Array.isArray(raw.commands)) {
+    return { ok: false, reason: "commands must be an array" };
+  }
+  if ("pushSnapshot" in raw && typeof raw.pushSnapshot !== "boolean") {
+    return { ok: false, reason: "pushSnapshot must be a boolean" };
+  }
+  if (
+    "commandTimeoutMs" in raw &&
+    (typeof raw.commandTimeoutMs !== "number" ||
+      !Number.isFinite(raw.commandTimeoutMs) ||
+      raw.commandTimeoutMs <= 0)
+  ) {
+    return { ok: false, reason: "commandTimeoutMs must be a positive number" };
   }
 
-  return { valid: true };
+  const str = (v) =>
+    typeof v === "string" && v.trim() !== "" ? v.trim() : undefined;
+
+  const snapshotId = str(raw.snapshotId);
+  const workDir = str(raw.workDir);
+  const repoName = str(raw.repoName);
+  const diff = str(raw.diff);
+
+  const commands = Array.isArray(raw.commands)
+    ? raw.commands.filter((c) => typeof c === "string" && c.trim()).map((c) => c.trim())
+    : [];
+  const pushSnapshot = raw.pushSnapshot === true;
+  const commandTimeoutMs =
+    typeof raw.commandTimeoutMs === "number" &&
+    Number.isFinite(raw.commandTimeoutMs) &&
+    raw.commandTimeoutMs > 0
+      ? Math.floor(raw.commandTimeoutMs)
+      : DEFAULT_TIMEOUT_MS;
+
+  if (!snapshotId && !workDir) {
+    return { ok: false, reason: "Either snapshotId or workDir is required" };
+  }
+  if (!diff && commands.length === 0 && !pushSnapshot) {
+    return {
+      ok: false,
+      reason: "Provide at least one of: diff, commands, or pushSnapshot",
+    };
+  }
+
+  return {
+    ok: true,
+    input: { snapshotId, workDir, repoName, diff, commands, pushSnapshot, commandTimeoutMs },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Command execution
+// ---------------------------------------------------------------------------
+
+/** @returns {string} */
+function truncate(str, limit = MAX_OUTPUT_BYTES) {
+  if (typeof str !== "string") return "";
+  if (Buffer.byteLength(str) <= limit) return str;
+  const buf = Buffer.from(str);
+  return buf.subarray(0, limit).toString("utf8") + "\n…[truncated]";
 }
 
 /**
- * @param {string} workDir
- * @param {string[]} commands
- * @returns {Promise<Array<Record<string, unknown>>>}
+ * Run commands sequentially in workDir. Stops on first failure.
  */
-async function runCommands(workDir, commands) {
-  const runCommand = async (command) =>
-    await new Promise((resolve) => {
-      const start = Date.now();
+async function runCommands(workDir, commands, timeoutMs) {
+  const results = [];
+  for (const command of commands) {
+    const start = Date.now();
+    const result = await new Promise((resolve) => {
       exec(
         command,
         {
           cwd: workDir,
-          env: {
-            ...process.env,
-            NODE_ENV: "test",
-          },
+          timeout: timeoutMs,
+          killSignal: "SIGKILL",
+          maxBuffer: 10 * 1024 * 1024,
+          env: { ...COMMAND_ENV, NODE_ENV: "test", CI: "true" },
         },
         (error, stdout, stderr) => {
           const durationMs = Date.now() - start;
-          const success = !error;
-          const exitCode =
-            error && typeof error.code === "number" ? error.code : 0;
+          const timedOut = !!(error && error.killed);
           resolve({
             command,
-            success,
-            exitCode,
+            success: !error,
+            exitCode: error && typeof error.code === "number" ? error.code : 0,
             durationMs,
-            stdout,
-            stderr,
+            stdout: truncate(stdout),
+            stderr: truncate(stderr),
+            timedOut,
           });
         },
       );
     });
 
-  const results = [];
-  for (const cmd of commands) {
-    // Run sequentially so commands can depend on previous steps.
-    // eslint-disable-next-line no-await-in-loop
-    const result = await runCommand(cmd);
     results.push(result);
+    if (!result.success) break;
   }
   return results;
 }
 
-const server = http.createServer(async (req, res) => {
-  if (
-    req.method !== "POST" ||
-    (req.url !== "/run-checks" && req.url !== "/run-edit-checks")
-  ) {
-    res.writeHead(404);
-    return res.end("Not found");
-  }
+// ---------------------------------------------------------------------------
+// Disk cleanup for pulled snapshots
+// ---------------------------------------------------------------------------
 
-  const isEditRoute = req.url === "/run-edit-checks";
-  let body = "";
+async function cleanWorkDir(workDir, wasPulled) {
+  if (!wasPulled || !workDir) return;
   try {
-    body = await readBody(req);
+    await fs.rm(workDir, { recursive: true, force: true });
   } catch {
-    res.writeHead(400);
-    return res.end("Invalid body");
+    // best effort
   }
+}
 
-  let parsed = {};
+// ---------------------------------------------------------------------------
+// Job lifecycle
+// ---------------------------------------------------------------------------
+
+function stamp(job, patch) {
+  Object.assign(job, patch, { updatedAt: new Date().toISOString() });
+}
+
+function toResponse(job) {
+  return {
+    jobId: job.jobId,
+    status: job.status,
+    stage: job.stage,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    workDir: job.workDir ?? null,
+    snapshotId: job.snapshotId ?? null,
+    repoName: job.repoName ?? null,
+    diffResult: job.diffResult ?? null,
+    commandResults: job.commandResults ?? [],
+    pushResult: job.pushResult ?? null,
+    error: job.error ?? null,
+  };
+}
+
+/** @param {Record<string, unknown>} job */
+async function executeJob(job) {
+  const { snapshotId, repoName, diff, commands, pushSnapshot, commandTimeoutMs } =
+    /** @type {NormalizedInput} */ (job.input);
+  let workDir = /** @type {string} */ (job.input.workDir) || "";
+  let pulledWorkDir = false;
+
   try {
-    parsed = parseJsonBody(body);
-  } catch (err) {
-    if (isEditRoute) {
-      return sendJson(res, 400, {
-        errorCode: ERROR_CODES.INVALID_JSON,
-        error: err instanceof Error ? err.message : "Invalid JSON",
-      });
-    }
-    res.writeHead(400);
-    return res.end("Invalid JSON");
-  }
-
-  const normalized = normalizeRequest(parsed);
-  const { snapshotId, repoName, commands, edits, pushSnapshot } = normalized;
-  let workDir = normalized.workDir || "";
-  const useEditFlow = isEditRoute || edits.length > 0 || pushSnapshot;
-
-  if (!snapshotId && !workDir) {
-    if (useEditFlow) {
-      return sendJson(res, 400, {
-        errorCode: ERROR_CODES.INVALID_REQUEST,
-        error: "Either snapshotId or workDir is required",
-      });
-    }
-    res.writeHead(400);
-    return res.end("workDir is required when snapshotId is not provided");
-  }
-  if (commands.length === 0) {
-    if (useEditFlow) {
-      return sendJson(res, 400, {
-        errorCode: ERROR_CODES.INVALID_REQUEST,
-        error: "commands must be a non-empty array of strings",
-      });
-    }
-    res.writeHead(400);
-    return res.end("commands must be a non-empty array of strings");
-  }
-
-  if (useEditFlow) {
-    if (
-      "pushSnapshot" in parsed &&
-      typeof parsed.pushSnapshot !== "boolean"
-    ) {
-      return sendJson(res, 400, {
-        errorCode: ERROR_CODES.INVALID_REQUEST,
-        error: "pushSnapshot must be a boolean when provided",
-      });
-    }
-
-    const editsValidation = validateEdits(edits);
-    if (!editsValidation.valid) {
-      return sendJson(res, 400, {
-        errorCode: ERROR_CODES.INVALID_REQUEST,
-        error: editsValidation.reason || "Invalid edits array",
-      });
-    }
-  }
-
-  if (snapshotId) {
-    try {
-      workDir = await pullSnapshot(snapshotId, repoName);
-    } catch (err) {
-      if (useEditFlow) {
-        return sendJson(res, 500, {
-          errorCode: ERROR_CODES.SNAPSHOT_PULL_FAILED,
-          snapshotId,
-          repoName,
-          error:
-            err instanceof Error
-              ? err.message
-              : "Failed to pull snapshot from configured storage",
-        });
-      }
-      return sendJson(res, 500, {
-        snapshotId,
-        repoName,
-        error:
-          err instanceof Error
-            ? err.message
-            : "Failed to pull snapshot from configured storage",
-      });
-    }
-  }
-
-  let editResults = [];
-  try {
-    if (useEditFlow && edits.length > 0) {
-      const editOutput = await applyEdits(workDir, edits);
-      editResults = editOutput.editResults;
-      if (editOutput.failedEditId) {
-        return sendJson(res, 400, {
-          errorCode: ERROR_CODES.EDIT_FAILED,
-          snapshotId,
-          repoName,
-          workDir,
-          failedEditId: editOutput.failedEditId,
-          editResults,
-        });
-      }
-    }
-
-    const results = await runCommands(workDir, commands);
-    const allSuccess = results.every((r) => r.success);
-
-    if (useEditFlow && allSuccess && pushSnapshot) {
+    // --- pull ---
+    stamp(job, { status: "running", stage: "pull" });
+    if (snapshotId) {
       try {
-        const pushedSnapshot = await pushSnapshotArtifact({
+        workDir = await pullSnapshot(snapshotId, repoName);
+        pulledWorkDir = true;
+      } catch (err) {
+        stamp(job, {
+          status: "failed",
+          stage: "pull",
+          error: { code: E.PULL_FAILED, message: errMsg(err) },
+        });
+        return;
+      }
+    }
+    stamp(job, { workDir, snapshotId, repoName });
+
+    // --- diff ---
+    if (diff) {
+      stamp(job, { stage: "diff" });
+      try {
+        const result = await applyDiff(workDir, diff);
+        stamp(job, { diffResult: { applied: true, paths: result.paths } });
+      } catch (err) {
+        stamp(job, {
+          status: "failed",
+          stage: "diff",
+          error: { code: E.DIFF_FAILED, message: errMsg(err) },
+        });
+        return;
+      }
+    }
+
+    // --- commands ---
+    if (commands.length > 0) {
+      stamp(job, { stage: "command" });
+      const results = await runCommands(workDir, commands, commandTimeoutMs);
+      stamp(job, { commandResults: results });
+      const failed = results.find((r) => !r.success);
+      if (failed) {
+        const code = failed.timedOut ? E.COMMAND_TIMEOUT : E.COMMAND_FAILED;
+        const message = failed.timedOut
+          ? `Timed out after ${commandTimeoutMs}ms: ${failed.command}`
+          : `Command failed: ${failed.command}`;
+        stamp(job, { status: "failed", stage: "command", error: { code, message } });
+        return;
+      }
+    }
+
+    // --- push ---
+    if (pushSnapshot) {
+      stamp(job, { stage: "push" });
+      try {
+        const result = await pushSnapshotArtifact({
           workDir,
           repoName,
           parentSnapshotId: snapshotId,
         });
-        return sendJson(res, 200, {
-          parentSnapshotId: snapshotId || null,
-          updatedSnapshotId: pushedSnapshot.snapshotId,
-          artifactType: "full",
-          provider: pushedSnapshot.provider,
-          storageKey: pushedSnapshot.key,
-          repoName,
-          workDir,
-          editResults,
-          results,
-        });
+        stamp(job, { pushResult: result });
       } catch (err) {
-        return sendJson(res, 500, {
-          errorCode: ERROR_CODES.PUSH_FAILED,
-          snapshotId,
-          repoName,
-          workDir,
-          editResults,
-          results,
-          error:
-            err instanceof Error ? err.message : "Failed to push updated snapshot",
+        stamp(job, {
+          status: "failed",
+          stage: "push",
+          error: { code: E.PUSH_FAILED, message: errMsg(err) },
         });
+        return;
       }
     }
 
-    if (useEditFlow) {
-      return sendJson(res, allSuccess ? 200 : 500, {
-        errorCode: allSuccess ? null : ERROR_CODES.COMMAND_EXECUTION_FAILED,
-        parentSnapshotId: snapshotId || null,
-        updatedSnapshotId: null, // Set when pushSnapshot=true and push succeeds
-        artifactType: null,
-        pushSnapshotRequested: pushSnapshot,
-        repoName,
-        workDir,
-        editResults,
-        results,
-      });
-    }
-
-    return sendJson(res, allSuccess ? 200 : 500, {
-      snapshotId,
-      repoName,
-      workDir,
-      results,
-    });
+    stamp(job, { status: "completed", stage: "done" });
   } catch (err) {
-    if (useEditFlow) {
-      return sendJson(res, 500, {
-        errorCode: ERROR_CODES.INTERNAL_ERROR,
-        snapshotId,
-          workDir,
-        repoName,
-        editResults,
-        error: err instanceof Error ? err.message : "Unknown error",
-      });
-    }
-    return sendJson(res, 500, {
-      snapshotId,
-      workDir,
-      error: err instanceof Error ? err.message : "Unknown error",
+    stamp(job, {
+      status: "failed",
+      stage: "internal",
+      error: { code: E.INTERNAL, message: errMsg(err) },
     });
+  } finally {
+    await cleanWorkDir(workDir, pulledWorkDir);
   }
+}
+
+function errMsg(err) {
+  return err instanceof Error ? err.message : "Unknown error";
+}
+
+// ---------------------------------------------------------------------------
+// Queue worker
+// ---------------------------------------------------------------------------
+
+async function drainQueue() {
+  if (workerBusy) return;
+  workerBusy = true;
+  while (queue.length > 0) {
+    const id = queue.shift();
+    const job = id && jobs.get(id);
+    if (job) await executeJob(job);
+  }
+  workerBusy = false;
+}
+
+// ---------------------------------------------------------------------------
+// Job cleanup (in-memory records)
+// ---------------------------------------------------------------------------
+
+function cleanup() {
+  const now = Date.now();
+  const stale = [];
+
+  for (const [id, job] of jobs) {
+    if (job.status !== "completed" && job.status !== "failed") continue;
+    const t = Date.parse(String(job.updatedAt || job.createdAt));
+    if (!Number.isNaN(t) && now - t > JOB_TTL_MS) {
+      jobs.delete(id);
+    } else {
+      stale.push([id, t]);
+    }
+  }
+
+  if (jobs.size > MAX_JOBS) {
+    stale.sort((a, b) => a[1] - b[1]);
+    while (jobs.size > MAX_JOBS && stale.length > 0) {
+      jobs.delete(stale.shift()[0]);
+    }
+  }
+}
+
+const cleanupTimer = setInterval(cleanup, CLEANUP_INTERVAL_MS);
+cleanupTimer.unref();
+
+// ---------------------------------------------------------------------------
+// HTTP server
+// ---------------------------------------------------------------------------
+
+const JOB_ID_RE = /^\/run-checks\/([^/]+)$/;
+
+const server = http.createServer(async (req, res) => {
+  // --- auth gate ---
+  if (!isAuthorized(req)) {
+    return json(res, 401, { code: E.UNAUTHORIZED, error: "Invalid or missing credentials" });
+  }
+
+  // --- poll job status ---
+  if (req.method === "GET") {
+    const m = req.url && JOB_ID_RE.exec(req.url);
+    if (!m) { res.writeHead(404); return res.end("Not found"); }
+    const job = jobs.get(decodeURIComponent(m[1]));
+    if (!job) return json(res, 404, { error: "Job not found" });
+    return json(res, 200, toResponse(job));
+  }
+
+  // --- submit job ---
+  if (req.method !== "POST" || req.url !== "/run-checks") {
+    res.writeHead(404);
+    return res.end("Not found");
+  }
+
+  let body;
+  try {
+    body = await readBody(req);
+  } catch {
+    return json(res, 400, { error: "Invalid or oversized body" });
+  }
+
+  let parsed;
+  try {
+    parsed = parseJson(body);
+  } catch (err) {
+    return json(res, 400, { code: E.BAD_JSON, error: errMsg(err) });
+  }
+
+  const v = validateAndNormalize(parsed);
+  if (!v.ok) {
+    return json(res, 400, { code: E.BAD_REQUEST, error: v.reason });
+  }
+
+  const jobId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const job = {
+    jobId,
+    status: "queued",
+    stage: "queued",
+    createdAt: now,
+    updatedAt: now,
+    input: v.input,
+    commandResults: [],
+  };
+
+  jobs.set(jobId, job);
+  queue.push(jobId);
+  void drainQueue();
+
+  return json(res, 202, { jobId, status: "queued" });
 });
 
 server.listen(PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(`Neurolink check-runner listening on port ${PORT}`);
+  console.log(`check-runner listening on :${PORT}`);
 });
