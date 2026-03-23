@@ -2,7 +2,7 @@ import http from "node:http";
 import { exec } from "node:child_process";
 import { pullSnapshot } from "./pullSnapshot.js";
 import { applyEdits } from "./editOperations.js";
-import { pushSnapshot } from "./pushSnapshot.js";
+import { pushSnapshot as pushSnapshotArtifact } from "./pushSnapshot.js";
 
 const PORT = process.env.PORT || 4000;
 
@@ -97,8 +97,9 @@ function normalizeRequest(parsed) {
 
   const editsInput = parsed.edits;
   const edits = Array.isArray(editsInput) ? editsInput : [];
+  const pushSnapshot = parsed.pushSnapshot === true;
 
-  return { snapshotId, workDir, repoName, commands, edits };
+  return { snapshotId, workDir, repoName, commands, edits, pushSnapshot };
 }
 
 /**
@@ -202,11 +203,12 @@ const server = http.createServer(async (req, res) => {
   }
 
   const normalized = normalizeRequest(parsed);
-  const { snapshotId, repoName, commands, edits } = normalized;
+  const { snapshotId, repoName, commands, edits, pushSnapshot } = normalized;
   let workDir = normalized.workDir || "";
+  const useEditFlow = isEditRoute || edits.length > 0 || pushSnapshot;
 
   if (!snapshotId && !workDir) {
-    if (isEditRoute) {
+    if (useEditFlow) {
       return sendJson(res, 400, {
         errorCode: ERROR_CODES.INVALID_REQUEST,
         error: "Either snapshotId or workDir is required",
@@ -216,7 +218,7 @@ const server = http.createServer(async (req, res) => {
     return res.end("workDir is required when snapshotId is not provided");
   }
   if (commands.length === 0) {
-    if (isEditRoute) {
+    if (useEditFlow) {
       return sendJson(res, 400, {
         errorCode: ERROR_CODES.INVALID_REQUEST,
         error: "commands must be a non-empty array of strings",
@@ -226,7 +228,17 @@ const server = http.createServer(async (req, res) => {
     return res.end("commands must be a non-empty array of strings");
   }
 
-  if (isEditRoute) {
+  if (useEditFlow) {
+    if (
+      "pushSnapshot" in parsed &&
+      typeof parsed.pushSnapshot !== "boolean"
+    ) {
+      return sendJson(res, 400, {
+        errorCode: ERROR_CODES.INVALID_REQUEST,
+        error: "pushSnapshot must be a boolean when provided",
+      });
+    }
+
     const editsValidation = validateEdits(edits);
     if (!editsValidation.valid) {
       return sendJson(res, 400, {
@@ -240,7 +252,7 @@ const server = http.createServer(async (req, res) => {
     try {
       workDir = await pullSnapshot(snapshotId, repoName);
     } catch (err) {
-      if (isEditRoute) {
+      if (useEditFlow) {
         return sendJson(res, 500, {
           errorCode: ERROR_CODES.SNAPSHOT_PULL_FAILED,
           snapshotId,
@@ -264,7 +276,7 @@ const server = http.createServer(async (req, res) => {
 
   let editResults = [];
   try {
-    if (isEditRoute && edits.length > 0) {
+    if (useEditFlow && edits.length > 0) {
       const editOutput = await applyEdits(workDir, edits);
       editResults = editOutput.editResults;
       if (editOutput.failedEditId) {
@@ -282,9 +294,9 @@ const server = http.createServer(async (req, res) => {
     const results = await runCommands(workDir, commands);
     const allSuccess = results.every((r) => r.success);
 
-    if (isEditRoute && allSuccess) {
+    if (useEditFlow && allSuccess && pushSnapshot) {
       try {
-        const pushedSnapshot = await pushSnapshot({
+        const pushedSnapshot = await pushSnapshotArtifact({
           workDir,
           repoName,
           parentSnapshotId: snapshotId,
@@ -314,12 +326,13 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    if (isEditRoute) {
+    if (useEditFlow) {
       return sendJson(res, allSuccess ? 200 : 500, {
         errorCode: allSuccess ? null : ERROR_CODES.COMMAND_EXECUTION_FAILED,
         parentSnapshotId: snapshotId || null,
-        updatedSnapshotId: null,
+        updatedSnapshotId: null, // Set when pushSnapshot=true and push succeeds
         artifactType: null,
+        pushSnapshotRequested: pushSnapshot,
         repoName,
         workDir,
         editResults,
@@ -334,7 +347,7 @@ const server = http.createServer(async (req, res) => {
       results,
     });
   } catch (err) {
-    if (isEditRoute) {
+    if (useEditFlow) {
       return sendJson(res, 500, {
         errorCode: ERROR_CODES.INTERNAL_ERROR,
         snapshotId,
