@@ -11,6 +11,18 @@ const pipe = promisify(pipeline);
 const execFile = promisify(execFileCb);
 
 const SNAPSHOT_ROOT = path.join(os.tmpdir(), "neurolink-snapshots");
+const PULL_TIMEOUT_MS = Number(process.env.CHECK_RUNNER_PULL_TIMEOUT_MS || 300_000); // 5 min
+
+/** Reject if promise doesn't resolve within ms. */
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
 
 /**
  * Download and extract a snapshot tarball from GCS.
@@ -38,8 +50,8 @@ export async function pullSnapshot(snapshotId) {
 
   try {
     const readStream = gcs().bucket(bucketName()).file(key).createReadStream();
-    await pipe(readStream, writeStream);
-    await execFile("tar", ["-xzf", archivePath, "-C", snapshotDir]);
+    await withTimeout(pipe(readStream, writeStream), PULL_TIMEOUT_MS, "Snapshot download");
+    await withTimeout(execFile("tar", ["-xzf", archivePath, "-C", snapshotDir]), PULL_TIMEOUT_MS, "Snapshot extraction");
   } finally {
     try { await fs.unlink(archivePath); } catch { /* best effort */ }
   }
