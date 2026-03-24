@@ -35,9 +35,9 @@ export async function pullSnapshot(snapshotId, repoName) {
 
   mkdirSync(SNAPSHOT_ROOT, { recursive: true });
 
-  const safeId = snapshotId.replace(/[^a-zA-Z0-9_.-]/g, "_");
+  const safeId = snapshotId.replace(/\.tar\.gz$/i, "").replace(/[^a-zA-Z0-9_.-]/g, "_");
   const snapshotDir = path.join(SNAPSHOT_ROOT, safeId);
-  const archivePath = `${snapshotDir}.tar.gz`;
+  const archivePath = path.join(SNAPSHOT_ROOT, `${safeId}.tar.gz`);
 
   // Wipe any previous extraction so stale files can't leak through.
   await fs.rm(snapshotDir, { recursive: true, force: true });
