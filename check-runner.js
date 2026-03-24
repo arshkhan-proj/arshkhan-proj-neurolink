@@ -247,9 +247,12 @@ async function executeJob(job) {
   try {
     // --- pull snapshot ---
     stamp(job, { status: "running", stage: "pull" });
+    console.log(`[JOB ${job.jobId}] starting | snapshot: ${snapshotId || "none"} | commands: ${commands.length}`);
     if (snapshotId) {
       try {
+        console.log(`[JOB ${job.jobId}] pulling snapshot...`);
         workDir = await pullSnapshot(snapshotId);
+        console.log(`[JOB ${job.jobId}] pull complete → ${workDir}`);
         pulledWorkDir = true;
       } catch (err) {
         stamp(job, {
@@ -264,6 +267,7 @@ async function executeJob(job) {
 
     // --- run commands ---
     stamp(job, { stage: "command" });
+    console.log(`[JOB ${job.jobId}] running ${commands.length} command(s) in ${workDir}`);
     const results = await runCommands(workDir, commands, commandTimeoutMs);
     stamp(job, { commandResults: results });
 
@@ -277,6 +281,7 @@ async function executeJob(job) {
       return;
     }
 
+    console.log(`[JOB ${job.jobId}] completed`);
     stamp(job, { status: "completed", stage: "done" });
   } catch (err) {
     stamp(job, {
@@ -354,9 +359,17 @@ const server = http.createServer(async (req, res) => {
   // --- poll job ---
   if (req.method === "GET") {
     const m = req.url && JOB_ID_RE.exec(req.url);
-    if (!m) { res.writeHead(404); return res.end("Not found"); }
-    const job = jobs.get(decodeURIComponent(m[1]));
-    if (!job) return json(res, 404, { error: "Job not found" });
+    if (!m) {
+      console.log(`[GET] 404 — no match for url: ${req.url}`);
+      res.writeHead(404); return res.end("Not found");
+    }
+    const jobId = decodeURIComponent(m[1]);
+    const job = jobs.get(jobId);
+    if (!job) {
+      console.log(`[GET] 404 — job not found: ${jobId} | total jobs in store: ${jobs.size} | ids: [${[...jobs.keys()].join(", ")}]`);
+      return json(res, 404, { error: "Job not found" });
+    }
+    console.log(`[GET] 200 — job: ${jobId} | status: ${job.status} | stage: ${job.stage}`);
     return json(res, 200, toResponse(job));
   }
 
@@ -393,6 +406,7 @@ const server = http.createServer(async (req, res) => {
 
   jobs.set(jobId, job);
   queue.push(jobId);
+  console.log(`[POST] 202 — queued job: ${jobId} | commands: ${v.input.commands.length} | snapshot: ${v.input.snapshotId || "none"}`);
   void drainQueue();
 
   return json(res, 202, { jobId, status: "queued" });
