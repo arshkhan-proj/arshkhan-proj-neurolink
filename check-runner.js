@@ -3,8 +3,6 @@ import { exec } from "node:child_process";
 import { promises as fs } from "node:fs";
 import crypto from "node:crypto";
 import { pullSnapshot } from "./pullSnapshot.js";
-import { applyDiff } from "./editOperations.js";
-import { pushSnapshot as pushSnapshotArtifact } from "./pushSnapshot.js";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -19,11 +17,11 @@ const MAX_JOBS = Number(process.env.CHECK_RUNNER_MAX_JOBS || 500);
 const DEFAULT_TIMEOUT_MS = Number(
   process.env.CHECK_RUNNER_COMMAND_TIMEOUT_MS || 600_000,
 );
-const MAX_BODY_BYTES = 5 * 1024 * 1024; // 5 MB
+const MAX_BODY_BYTES = 1 * 1024 * 1024; // 1 MB — no diffs/edits, just commands
 const MAX_OUTPUT_BYTES = 100 * 1024; // 100 KB per stdout/stderr
 
 // Env vars that commands are allowed to see.
-// Everything else (cloud credentials, auth secret) stays with the server.
+// Cloud credentials and auth secret never reach subprocesses.
 const COMMAND_ENV = Object.fromEntries(
   [
     "PATH",
@@ -51,10 +49,8 @@ const E = {
   BAD_REQUEST: "BAD_REQUEST",
   BAD_JSON: "BAD_JSON",
   PULL_FAILED: "PULL_FAILED",
-  DIFF_FAILED: "DIFF_FAILED",
   COMMAND_FAILED: "COMMAND_FAILED",
   COMMAND_TIMEOUT: "COMMAND_TIMEOUT",
-  PUSH_FAILED: "PUSH_FAILED",
   INTERNAL: "INTERNAL",
 };
 
@@ -71,17 +67,14 @@ let workerBusy = false;
 // Auth
 // ---------------------------------------------------------------------------
 
-/**
- * @param {http.IncomingMessage} req
- * @returns {boolean}
- */
+/** @param {http.IncomingMessage} req */
 function isAuthorized(req) {
-  if (!AUTH_SECRET) return true; // no secret configured = open (dev mode)
+  if (!AUTH_SECRET) return true;
   const header = req.headers["authorization"] || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
   if (token && token === AUTH_SECRET) return true;
-  const keyHeader = req.headers["x-api-key"];
-  if (typeof keyHeader === "string" && keyHeader === AUTH_SECRET) return true;
+  const key = req.headers["x-api-key"];
+  if (typeof key === "string" && key === AUTH_SECRET) return true;
   return false;
 }
 
@@ -89,13 +82,11 @@ function isAuthorized(req) {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-/** @param {http.ServerResponse} res */
 function json(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(body));
 }
 
-/** @param {http.IncomingMessage} req */
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -114,7 +105,6 @@ function readBody(req) {
   });
 }
 
-/** @returns {Record<string, unknown>} */
 function parseJson(raw) {
   if (!raw || raw.trim() === "") return {};
   const obj = JSON.parse(raw);
@@ -125,32 +115,23 @@ function parseJson(raw) {
 }
 
 // ---------------------------------------------------------------------------
-// Input normalisation + validation (single pass)
+// Validation
 // ---------------------------------------------------------------------------
 
 /**
- * @param {Record<string, unknown>} raw
- * @returns {{ ok: true; input: NormalizedInput } | { ok: false; reason: string }}
- *
  * @typedef {{
  *   snapshotId?: string;
  *   workDir?: string;
  *   repoName?: string;
- *   diff?: string;
  *   commands: string[];
- *   pushSnapshot: boolean;
  *   commandTimeoutMs: number;
- * }} NormalizedInput
+ * }} JobInput
  */
+
+/** @returns {{ ok: true; input: JobInput } | { ok: false; reason: string }} */
 function validateAndNormalize(raw) {
-  if ("diff" in raw && (typeof raw.diff !== "string" || !raw.diff.trim())) {
-    return { ok: false, reason: "diff must be a non-empty string" };
-  }
   if ("commands" in raw && !Array.isArray(raw.commands)) {
     return { ok: false, reason: "commands must be an array" };
-  }
-  if ("pushSnapshot" in raw && typeof raw.pushSnapshot !== "boolean") {
-    return { ok: false, reason: "pushSnapshot must be a boolean" };
   }
   if (
     "commandTimeoutMs" in raw &&
@@ -167,12 +148,11 @@ function validateAndNormalize(raw) {
   const snapshotId = str(raw.snapshotId);
   const workDir = str(raw.workDir);
   const repoName = str(raw.repoName);
-  const diff = str(raw.diff);
 
   const commands = Array.isArray(raw.commands)
     ? raw.commands.filter((c) => typeof c === "string" && c.trim()).map((c) => c.trim())
     : [];
-  const pushSnapshot = raw.pushSnapshot === true;
+
   const commandTimeoutMs =
     typeof raw.commandTimeoutMs === "number" &&
     Number.isFinite(raw.commandTimeoutMs) &&
@@ -183,24 +163,17 @@ function validateAndNormalize(raw) {
   if (!snapshotId && !workDir) {
     return { ok: false, reason: "Either snapshotId or workDir is required" };
   }
-  if (!diff && commands.length === 0 && !pushSnapshot) {
-    return {
-      ok: false,
-      reason: "Provide at least one of: diff, commands, or pushSnapshot",
-    };
+  if (commands.length === 0) {
+    return { ok: false, reason: "commands must be a non-empty array" };
   }
 
-  return {
-    ok: true,
-    input: { snapshotId, workDir, repoName, diff, commands, pushSnapshot, commandTimeoutMs },
-  };
+  return { ok: true, input: { snapshotId, workDir, repoName, commands, commandTimeoutMs } };
 }
 
 // ---------------------------------------------------------------------------
 // Command execution
 // ---------------------------------------------------------------------------
 
-/** @returns {string} */
 function truncate(str, limit = MAX_OUTPUT_BYTES) {
   if (typeof str !== "string") return "";
   if (Buffer.byteLength(str) <= limit) return str;
@@ -208,9 +181,7 @@ function truncate(str, limit = MAX_OUTPUT_BYTES) {
   return buf.subarray(0, limit).toString("utf8") + "\n…[truncated]";
 }
 
-/**
- * Run commands sequentially in workDir. Stops on first failure.
- */
+/** Run commands sequentially. Stops on first failure. */
 async function runCommands(workDir, commands, timeoutMs) {
   const results = [];
   for (const command of commands) {
@@ -248,19 +219,6 @@ async function runCommands(workDir, commands, timeoutMs) {
 }
 
 // ---------------------------------------------------------------------------
-// Disk cleanup for pulled snapshots
-// ---------------------------------------------------------------------------
-
-async function cleanWorkDir(workDir, wasPulled) {
-  if (!wasPulled || !workDir) return;
-  try {
-    await fs.rm(workDir, { recursive: true, force: true });
-  } catch {
-    // best effort
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Job lifecycle
 // ---------------------------------------------------------------------------
 
@@ -278,22 +236,19 @@ function toResponse(job) {
     workDir: job.workDir ?? null,
     snapshotId: job.snapshotId ?? null,
     repoName: job.repoName ?? null,
-    diffResult: job.diffResult ?? null,
     commandResults: job.commandResults ?? [],
-    pushResult: job.pushResult ?? null,
     error: job.error ?? null,
   };
 }
 
-/** @param {Record<string, unknown>} job */
 async function executeJob(job) {
-  const { snapshotId, repoName, diff, commands, pushSnapshot, commandTimeoutMs } =
-    /** @type {NormalizedInput} */ (job.input);
+  const { snapshotId, repoName, commands, commandTimeoutMs } =
+    /** @type {JobInput} */ (job.input);
   let workDir = /** @type {string} */ (job.input.workDir) || "";
   let pulledWorkDir = false;
 
   try {
-    // --- pull ---
+    // --- pull snapshot ---
     stamp(job, { status: "running", stage: "pull" });
     if (snapshotId) {
       try {
@@ -310,56 +265,19 @@ async function executeJob(job) {
     }
     stamp(job, { workDir, snapshotId, repoName });
 
-    // --- diff ---
-    if (diff) {
-      stamp(job, { stage: "diff" });
-      try {
-        const result = await applyDiff(workDir, diff);
-        stamp(job, { diffResult: { applied: true, paths: result.paths } });
-      } catch (err) {
-        stamp(job, {
-          status: "failed",
-          stage: "diff",
-          error: { code: E.DIFF_FAILED, message: errMsg(err) },
-        });
-        return;
-      }
-    }
+    // --- run commands ---
+    stamp(job, { stage: "command" });
+    const results = await runCommands(workDir, commands, commandTimeoutMs);
+    stamp(job, { commandResults: results });
 
-    // --- commands ---
-    if (commands.length > 0) {
-      stamp(job, { stage: "command" });
-      const results = await runCommands(workDir, commands, commandTimeoutMs);
-      stamp(job, { commandResults: results });
-      const failed = results.find((r) => !r.success);
-      if (failed) {
-        const code = failed.timedOut ? E.COMMAND_TIMEOUT : E.COMMAND_FAILED;
-        const message = failed.timedOut
-          ? `Timed out after ${commandTimeoutMs}ms: ${failed.command}`
-          : `Command failed: ${failed.command}`;
-        stamp(job, { status: "failed", stage: "command", error: { code, message } });
-        return;
-      }
-    }
-
-    // --- push ---
-    if (pushSnapshot) {
-      stamp(job, { stage: "push" });
-      try {
-        const result = await pushSnapshotArtifact({
-          workDir,
-          repoName,
-          parentSnapshotId: snapshotId,
-        });
-        stamp(job, { pushResult: result });
-      } catch (err) {
-        stamp(job, {
-          status: "failed",
-          stage: "push",
-          error: { code: E.PUSH_FAILED, message: errMsg(err) },
-        });
-        return;
-      }
+    const failed = results.find((r) => !r.success);
+    if (failed) {
+      const code = failed.timedOut ? E.COMMAND_TIMEOUT : E.COMMAND_FAILED;
+      const message = failed.timedOut
+        ? `Timed out after ${commandTimeoutMs}ms: ${failed.command}`
+        : `Command failed: ${failed.command}`;
+      stamp(job, { status: "failed", stage: "command", error: { code, message } });
+      return;
     }
 
     stamp(job, { status: "completed", stage: "done" });
@@ -370,7 +288,10 @@ async function executeJob(job) {
       error: { code: E.INTERNAL, message: errMsg(err) },
     });
   } finally {
-    await cleanWorkDir(workDir, pulledWorkDir);
+    // Clean up pulled snapshot directory.
+    if (pulledWorkDir && workDir) {
+      try { await fs.rm(workDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
   }
 }
 
@@ -429,12 +350,11 @@ cleanupTimer.unref();
 const JOB_ID_RE = /^\/run-checks\/([^/]+)$/;
 
 const server = http.createServer(async (req, res) => {
-  // --- auth gate ---
   if (!isAuthorized(req)) {
     return json(res, 401, { code: E.UNAUTHORIZED, error: "Invalid or missing credentials" });
   }
 
-  // --- poll job status ---
+  // --- poll job ---
   if (req.method === "GET") {
     const m = req.url && JOB_ID_RE.exec(req.url);
     if (!m) { res.writeHead(404); return res.end("Not found"); }
@@ -450,23 +370,17 @@ const server = http.createServer(async (req, res) => {
   }
 
   let body;
-  try {
-    body = await readBody(req);
-  } catch {
+  try { body = await readBody(req); } catch {
     return json(res, 400, { error: "Invalid or oversized body" });
   }
 
   let parsed;
-  try {
-    parsed = parseJson(body);
-  } catch (err) {
+  try { parsed = parseJson(body); } catch (err) {
     return json(res, 400, { code: E.BAD_JSON, error: errMsg(err) });
   }
 
   const v = validateAndNormalize(parsed);
-  if (!v.ok) {
-    return json(res, 400, { code: E.BAD_REQUEST, error: v.reason });
-  }
+  if (!v.ok) return json(res, 400, { code: E.BAD_REQUEST, error: v.reason });
 
   const jobId = crypto.randomUUID();
   const now = new Date().toISOString();
