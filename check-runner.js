@@ -122,7 +122,6 @@ function parseJson(raw) {
  * @typedef {{
  *   snapshotId?: string;
  *   workDir?: string;
- *   repoName?: string;
  *   commands: string[];
  *   commandTimeoutMs: number;
  * }} JobInput
@@ -147,7 +146,6 @@ function validateAndNormalize(raw) {
 
   const snapshotId = str(raw.snapshotId);
   const workDir = str(raw.workDir);
-  const repoName = str(raw.repoName);
 
   const commands = Array.isArray(raw.commands)
     ? raw.commands.filter((c) => typeof c === "string" && c.trim()).map((c) => c.trim())
@@ -167,7 +165,7 @@ function validateAndNormalize(raw) {
     return { ok: false, reason: "commands must be a non-empty array" };
   }
 
-  return { ok: true, input: { snapshotId, workDir, repoName, commands, commandTimeoutMs } };
+  return { ok: true, input: { snapshotId, workDir, commands, commandTimeoutMs } };
 }
 
 // ---------------------------------------------------------------------------
@@ -235,14 +233,13 @@ function toResponse(job) {
     updatedAt: job.updatedAt,
     workDir: job.workDir ?? null,
     snapshotId: job.snapshotId ?? null,
-    repoName: job.repoName ?? null,
     commandResults: job.commandResults ?? [],
     error: job.error ?? null,
   };
 }
 
 async function executeJob(job) {
-  const { snapshotId, repoName, commands, commandTimeoutMs } =
+  const { snapshotId, commands, commandTimeoutMs } =
     /** @type {JobInput} */ (job.input);
   let workDir = /** @type {string} */ (job.input.workDir) || "";
   let pulledWorkDir = false;
@@ -252,7 +249,7 @@ async function executeJob(job) {
     stamp(job, { status: "running", stage: "pull" });
     if (snapshotId) {
       try {
-        workDir = await pullSnapshot(snapshotId, repoName);
+        workDir = await pullSnapshot(snapshotId);
         pulledWorkDir = true;
       } catch (err) {
         stamp(job, {
@@ -263,7 +260,7 @@ async function executeJob(job) {
         return;
       }
     }
-    stamp(job, { workDir, snapshotId, repoName });
+    stamp(job, { workDir, snapshotId });
 
     // --- run commands ---
     stamp(job, { stage: "command" });

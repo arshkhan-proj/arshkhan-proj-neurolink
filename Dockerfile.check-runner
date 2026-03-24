@@ -1,7 +1,4 @@
-#############################
-# Neurolink check-runner image
-#############################
-FROM public.ecr.aws/docker/library/node:24-slim
+FROM node:24-alpine
 
 ENV HOME=/tmp
 ENV XDG_CACHE_HOME=/tmp/.cache
@@ -11,28 +8,18 @@ ENV PATH="${PNPM_HOME}:${PATH}"
 
 WORKDIR /usr/src/app
 
-# Runtime dependencies: TLS certs + lsof (used by test commands to check ports)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates lsof && \
-    rm -rf /var/lib/apt/lists/*
-
-# Enable pnpm so commands like `pnpm test` work.
+# Enable pnpm so snapshot commands like `pnpm test` work.
 RUN corepack enable && corepack prepare pnpm@10.15.0 --activate
 
-# Snapshot pull dependencies (S3 + GCS) + set ESM mode.
-RUN npm install @aws-sdk/client-s3 @google-cloud/storage && \
-    npm pkg set type=module
+# GCS SDK for snapshot pulls + set ESM mode.
+RUN npm install @google-cloud/storage && npm pkg set type=module
 
-# Copy only the 3 files the check-runner needs.
 COPY check-runner.js snapshotStorage.js pullSnapshot.js ./
 
 # Non-root user.
-RUN groupadd --gid 1001 runner && \
-    useradd --uid 1001 --gid 1001 runner && \
+RUN addgroup -g 1001 runner && adduser -u 1001 -G runner -D runner && \
     chown -R runner:runner /usr/src/app /tmp
 
 EXPOSE 4000
-
 USER runner
-
 CMD ["node", "check-runner.js"]

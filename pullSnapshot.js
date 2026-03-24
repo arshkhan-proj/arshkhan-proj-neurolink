@@ -1,4 +1,3 @@
-import { GetObjectCommand } from "@aws-sdk/client-s3";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import { pipeline } from "node:stream";
@@ -6,15 +5,7 @@ import { promisify } from "node:util";
 import { execFile as execFileCb } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
-import {
-  resolveProvider,
-  storageKey,
-  s3,
-  s3Bucket,
-  gcs,
-  gcsBucketName,
-  removeFile,
-} from "./snapshotStorage.js";
+import { storageKey, gcs, bucketName } from "./snapshotStorage.js";
 
 const pipe = promisify(pipeline);
 const execFile = promisify(execFileCb);
@@ -22,13 +13,12 @@ const execFile = promisify(execFileCb);
 const SNAPSHOT_ROOT = path.join(os.tmpdir(), "neurolink-snapshots");
 
 /**
- * Download and extract a snapshot tarball from S3 or GCS.
+ * Download and extract a snapshot tarball from GCS.
  *
  * @param {string} snapshotId  e.g. "lighthouse-snapshot-abc123.tar.gz"
- * @param {string | undefined} repoName
  * @returns {Promise<string>} absolute path to the extracted directory
  */
-export async function pullSnapshot(snapshotId, repoName) {
+export async function pullSnapshot(snapshotId) {
   if (!snapshotId || typeof snapshotId !== "string") {
     throw new Error("snapshotId must be a non-empty string");
   }
@@ -43,33 +33,15 @@ export async function pullSnapshot(snapshotId, repoName) {
   await fs.rm(snapshotDir, { recursive: true, force: true });
   mkdirSync(snapshotDir, { recursive: true });
 
-  // --- download ---
-  const provider = resolveProvider();
-  const key = storageKey(snapshotId, repoName);
+  const key = storageKey(snapshotId);
   const writeStream = createWriteStream(archivePath);
 
   try {
-    if (provider === "gcs") {
-      const readStream = gcs()
-        .bucket(gcsBucketName())
-        .file(key)
-        .createReadStream();
-      await pipe(readStream, writeStream);
-    } else {
-      const response = await s3().send(
-        new GetObjectCommand({ Bucket: s3Bucket(), Key: key }),
-      );
-      if (!response.Body) {
-        throw new Error(`Empty S3 response for s3://${s3Bucket()}/${key}`);
-      }
-      await pipe(/** @type {NodeJS.ReadableStream} */ (response.Body), writeStream);
-    }
-
-    // --- extract (no shell — immune to injection) ---
+    const readStream = gcs().bucket(bucketName()).file(key).createReadStream();
+    await pipe(readStream, writeStream);
     await execFile("tar", ["-xzf", archivePath, "-C", snapshotDir]);
   } finally {
-    // Always clean up the archive — we only need the extracted dir.
-    await removeFile(archivePath);
+    try { await fs.unlink(archivePath); } catch { /* best effort */ }
   }
 
   return snapshotDir;
