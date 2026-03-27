@@ -480,6 +480,34 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, toResponse(job));
   }
 
+  // --- temporary debug endpoint (remove after testing) ---
+  if (req.method === "GET" && req.url === "/debug") {
+    const results = {};
+    try { results.gitVersion = (await execFile("git", ["--version"])).stdout.trim(); } catch (e) { results.gitVersion = errMsg(e); }
+    results.GIT_REPO_URL = GIT_REPO_URL || "(not set)";
+    results.GIT_READ_TOKEN_length = GIT_READ_TOKEN.length;
+    results.GIT_READ_TOKEN_prefix = GIT_READ_TOKEN.slice(0, 10) + "...";
+    results.GIT_READ_TOKEN_suffix = "..." + GIT_READ_TOKEN.slice(-5);
+
+    // Test 1: http.extraHeader with Bearer
+    try {
+      const authHeader = `Authorization: Bearer ${GIT_READ_TOKEN}`;
+      const { stdout } = await execFile("git", ["-c", `http.extraHeader=${authHeader}`, "ls-remote", GIT_REPO_URL, "HEAD"], { timeout: 15000, env: { ...COMMAND_ENV, GIT_TERMINAL_PROMPT: "0" } });
+      results.bearerTest = { success: true, output: stdout.trim() };
+    } catch (e) { results.bearerTest = { success: false, error: e.stderr || errMsg(e) }; }
+
+    // Test 2: URL-embedded creds (URL-encoded)
+    try {
+      const u = new URL(GIT_REPO_URL.startsWith("http") ? GIT_REPO_URL : `https://${GIT_REPO_URL}`);
+      u.username = "x-token-auth";
+      u.password = GIT_READ_TOKEN;
+      const { stdout } = await execFile("git", ["ls-remote", u.toString(), "HEAD"], { timeout: 15000, env: { ...COMMAND_ENV, GIT_TERMINAL_PROMPT: "0" } });
+      results.urlCredsTest = { success: true, output: stdout.trim() };
+    } catch (e) { results.urlCredsTest = { success: false, error: e.stderr || errMsg(e) }; }
+
+    return json(res, 200, results);
+  }
+
   // --- submit job ---
   if (req.method !== "POST" || req.url !== "/run-checks") {
     res.writeHead(404); return res.end("Not found");
