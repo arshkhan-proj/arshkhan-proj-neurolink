@@ -254,7 +254,7 @@ async function fetchAndMerge(workDir, branchRef) {
 async function runPnpmInstall(workDir, timeoutMs) {
   return new Promise((resolve, reject) => {
     exec(
-      "pnpm install --frozen-lockfile --prefer-offline",
+      "pnpm install --frozen-lockfile",
       {
         cwd: workDir,
         timeout: timeoutMs,
