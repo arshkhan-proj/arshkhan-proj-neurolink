@@ -466,22 +466,8 @@ const server = http.createServer(async (req, res) => {
     return json(res, 401, { code: E.UNAUTHORIZED, error: "Invalid or missing credentials" });
   }
 
-  // --- poll job ---
-  if (req.method === "GET") {
-    const m = req.url && JOB_ID_RE.exec(req.url);
-    if (!m) { res.writeHead(404); return res.end("Not found"); }
-    const jobId = decodeURIComponent(m[1]);
-    const job = jobs.get(jobId);
-    if (!job) {
-      console.log(`[GET] 404 — job not found: ${jobId}`);
-      return json(res, 404, { error: "Job not found" });
-    }
-    console.log(`[GET] 200 — job: ${jobId} | status: ${job.status} | stage: ${job.stage}`);
-    return json(res, 200, toResponse(job));
-  }
-
   // --- temporary debug endpoint (remove after testing) ---
-  if (req.method === "GET" && req.url === "/debug") {
+  if (req.method === "GET" && req.url === "/run-checks/debug") {
     const results = {};
     try { results.gitVersion = (await execFile("git", ["--version"])).stdout.trim(); } catch (e) { results.gitVersion = errMsg(e); }
     results.GIT_REPO_URL = GIT_REPO_URL || "(not set)";
@@ -506,6 +492,20 @@ const server = http.createServer(async (req, res) => {
     } catch (e) { results.urlCredsTest = { success: false, error: e.stderr || errMsg(e) }; }
 
     return json(res, 200, results);
+  }
+
+  // --- poll job ---
+  if (req.method === "GET") {
+    const m = req.url && JOB_ID_RE.exec(req.url);
+    if (!m) { res.writeHead(404); return res.end("Not found"); }
+    const jobId = decodeURIComponent(m[1]);
+    const job = jobs.get(jobId);
+    if (!job) {
+      console.log(`[GET] 404 — job not found: ${jobId}`);
+      return json(res, 404, { error: "Job not found" });
+    }
+    console.log(`[GET] 200 — job: ${jobId} | status: ${job.status} | stage: ${job.stage}`);
+    return json(res, 200, toResponse(job));
   }
 
   // --- submit job ---
