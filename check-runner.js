@@ -3,6 +3,7 @@ import { exec, execFile as execFileCb } from "node:child_process";
 import { promises as fs } from "node:fs";
 import crypto from "node:crypto";
 import { promisify } from "node:util";
+import path from "node:path";
 import { pullSnapshot } from "./pullSnapshot.js";
 import { resolveSnapshotId } from "./snapshotStorage.js";
 
@@ -225,9 +226,7 @@ async function fetchAndMerge(workDir, branchRef) {
     { cwd: workDir, timeout: GIT_FETCH_TIMEOUT_MS, env: gitEnv },
   );
 
-  // Check whether the lockfile is changing before we merge.
-  // Two-dot diff compares trees directly — works even with shallow clones that
-  // have no common ancestor.
+  // Detect changed files — two-dot diff compares trees directly, no merge base needed.
   const { stdout: diffNames } = await execFile(
     "git",
     ["diff", "--name-only", "HEAD", "FETCH_HEAD"],
@@ -235,12 +234,22 @@ async function fetchAndMerge(workDir, branchRef) {
   );
   const lockfileChanged = diffNames.split("\n").some((f) => f.trim() === "pnpm-lock.yaml");
 
-  // Merge the fetched branch into the working tree without committing.
-  // --allow-unrelated-histories handles shallow clone snapshots from Jenkins.
-  // --no-commit leaves the tree in a merged state so commands run against real content.
+  // Delete files removed in the feature branch before overlaying.
+  const { stdout: deletedNames } = await execFile(
+    "git",
+    ["diff", "--name-only", "--diff-filter=D", "HEAD", "FETCH_HEAD"],
+    { cwd: workDir, env: gitEnv },
+  );
+  const deleted = deletedNames.split("\n").map((f) => f.trim()).filter(Boolean);
+  for (const f of deleted) {
+    await fs.rm(path.join(workDir, f), { force: true });
+  }
+
+  // Overlay feature branch files directly onto the beta working tree.
+  // No merge, no conflicts — just takes feature branch file state as-is.
   await execFile(
     "git",
-    ["merge", "--no-commit", "--no-edit", "--allow-unrelated-histories", "FETCH_HEAD"],
+    ["checkout", "FETCH_HEAD", "--", "."],
     { cwd: workDir, env: gitEnv },
   );
 
