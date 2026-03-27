@@ -32,6 +32,11 @@ const COMMAND_ENV = Object.fromEntries(
   [
     "PATH", "HOME", "USER", "SHELL", "LANG", "TERM", "TMPDIR",
     "NODE_VERSION", "HOSTNAME", "npm_config_cache", "PNPM_HOME", "COREPACK_HOME",
+    // Network/proxy/SSL — required for git to reach internal hosts like Bitbucket.
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_SSL_CAINFO", "GIT_SSL_CAPATH",
+    "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
   ]
     .filter((k) => process.env[k] !== undefined)
     .map((k) => [k, process.env[k]]),
