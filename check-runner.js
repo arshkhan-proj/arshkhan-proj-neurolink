@@ -1,41 +1,37 @@
 import http from "node:http";
-import { exec } from "node:child_process";
+import { exec, execFile as execFileCb } from "node:child_process";
 import { promises as fs } from "node:fs";
 import crypto from "node:crypto";
+import { promisify } from "node:util";
 import { pullSnapshot } from "./pullSnapshot.js";
+import { resolveSnapshotId } from "./snapshotStorage.js";
+
+const execFile = promisify(execFileCb);
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 const PORT = Number(process.env.PORT || 4000);
-const AUTH_SECRET = process.env.CHECK_RUNNER_SECRET || "";
+const JWT_SECRET = process.env.CHECK_RUNNER_JWT_SECRET || "";
 const JOB_TTL_MS = Number(process.env.CHECK_RUNNER_JOB_TTL_MS || 3_600_000);
-const CLEANUP_INTERVAL_MS = Number(
-  process.env.CHECK_RUNNER_JOB_CLEANUP_INTERVAL_MS || 60_000,
-);
+const CLEANUP_INTERVAL_MS = Number(process.env.CHECK_RUNNER_JOB_CLEANUP_INTERVAL_MS || 60_000);
 const MAX_JOBS = Number(process.env.CHECK_RUNNER_MAX_JOBS || 500);
-const DEFAULT_TIMEOUT_MS = Number(
-  process.env.CHECK_RUNNER_COMMAND_TIMEOUT_MS || 600_000,
-);
-const MAX_BODY_BYTES = 1 * 1024 * 1024; // 1 MB — no diffs/edits, just commands
-const MAX_OUTPUT_BYTES = 100 * 1024; // 100 KB per stdout/stderr
+const DEFAULT_TIMEOUT_MS = Number(process.env.CHECK_RUNNER_COMMAND_TIMEOUT_MS || 600_000);
+const GIT_FETCH_TIMEOUT_MS = Number(process.env.CHECK_RUNNER_GIT_FETCH_TIMEOUT_MS || 60_000);
+const MAX_BODY_BYTES = 1 * 1024 * 1024;
+const MAX_OUTPUT_BYTES = 100 * 1024;
+
+// Git credentials for fetching feature branches — never passed to user commands.
+const GIT_REPO_URL = process.env.GIT_REPO_URL || "";           // e.g. https://bitbucket.juspay.net/scm/bz/lighthouse.git
+const GIT_READ_USERNAME = process.env.GIT_READ_USERNAME || ""; // e.g. titan.a@juspay.in
+const GIT_READ_TOKEN = process.env.GIT_READ_TOKEN || "";       // bearer token from k8s secret
 
 // Env vars that commands are allowed to see.
-// Cloud credentials and auth secret never reach subprocesses.
+// Git creds, JWT secret, and cloud credentials never reach subprocesses.
 const COMMAND_ENV = Object.fromEntries(
   [
-    "PATH",
-    "HOME",
-    "USER",
-    "SHELL",
-    "LANG",
-    "TERM",
-    "TMPDIR",
-    "NODE_VERSION",
-    "HOSTNAME",
-    "npm_config_cache",
-    "PNPM_HOME",
-    "COREPACK_HOME",
+    "PATH", "HOME", "USER", "SHELL", "LANG", "TERM", "TMPDIR",
+    "NODE_VERSION", "HOSTNAME", "npm_config_cache", "PNPM_HOME", "COREPACK_HOME",
   ]
     .filter((k) => process.env[k] !== undefined)
     .map((k) => [k, process.env[k]]),
@@ -45,13 +41,15 @@ const COMMAND_ENV = Object.fromEntries(
 // Error codes
 // ---------------------------------------------------------------------------
 const E = {
-  UNAUTHORIZED: "UNAUTHORIZED",
-  BAD_REQUEST: "BAD_REQUEST",
-  BAD_JSON: "BAD_JSON",
-  PULL_FAILED: "PULL_FAILED",
-  COMMAND_FAILED: "COMMAND_FAILED",
+  UNAUTHORIZED:    "UNAUTHORIZED",
+  BAD_REQUEST:     "BAD_REQUEST",
+  BAD_JSON:        "BAD_JSON",
+  PULL_FAILED:     "PULL_FAILED",
+  FETCH_FAILED:    "FETCH_FAILED",
+  INSTALL_FAILED:  "INSTALL_FAILED",
+  COMMAND_FAILED:  "COMMAND_FAILED",
   COMMAND_TIMEOUT: "COMMAND_TIMEOUT",
-  INTERNAL: "INTERNAL",
+  INTERNAL:        "INTERNAL",
 };
 
 // ---------------------------------------------------------------------------
@@ -64,18 +62,53 @@ const queue = [];
 let workerBusy = false;
 
 // ---------------------------------------------------------------------------
-// Auth
+// JWT Auth (HS256 — uses Node built-in crypto, no external deps)
 // ---------------------------------------------------------------------------
+
+function base64UrlDecode(str) {
+  return Buffer.from(str.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+}
+
+/**
+ * Verify a HS256 JWT. Returns the payload on success, null on any failure.
+ * @param {string} token
+ * @returns {{ sub?: string; iat?: number; exp?: number } | null}
+ */
+function verifyJwt(token) {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+
+  const [headerB64, payloadB64, sigB64] = parts;
+
+  try {
+    const header = JSON.parse(base64UrlDecode(headerB64).toString());
+    if (header.alg !== "HS256") return null;
+  } catch { return null; }
+
+  const expected = crypto
+    .createHmac("sha256", JWT_SECRET)
+    .update(`${headerB64}.${payloadB64}`)
+    .digest();
+  const actual = base64UrlDecode(sigB64);
+  if (expected.length !== actual.length) return null;
+  if (!crypto.timingSafeEqual(expected, actual)) return null;
+
+  let payload;
+  try { payload = JSON.parse(base64UrlDecode(payloadB64).toString()); } catch { return null; }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (typeof payload.exp === "number" && now > payload.exp) return null;
+
+  return payload;
+}
 
 /** @param {http.IncomingMessage} req */
 function isAuthorized(req) {
-  if (!AUTH_SECRET) return true;
+  if (!JWT_SECRET) return true;
   const header = req.headers["authorization"] || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-  if (token && token === AUTH_SECRET) return true;
-  const key = req.headers["x-api-key"];
-  if (typeof key === "string" && key === AUTH_SECRET) return true;
-  return false;
+  if (!token) return false;
+  return verifyJwt(token) !== null;
 }
 
 // ---------------------------------------------------------------------------
@@ -93,11 +126,7 @@ function readBody(req) {
     let bytes = 0;
     req.on("data", (chunk) => {
       bytes += chunk.length;
-      if (bytes > MAX_BODY_BYTES) {
-        req.destroy();
-        reject(new Error("Request body too large"));
-        return;
-      }
+      if (bytes > MAX_BODY_BYTES) { req.destroy(); reject(new Error("Request body too large")); return; }
       chunks.push(chunk);
     });
     req.on("end", () => resolve(Buffer.concat(chunks).toString()));
@@ -108,9 +137,7 @@ function readBody(req) {
 function parseJson(raw) {
   if (!raw || raw.trim() === "") return {};
   const obj = JSON.parse(raw);
-  if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
-    throw new Error("Body must be a JSON object");
-  }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) throw new Error("Body must be a JSON object");
   return obj;
 }
 
@@ -120,8 +147,8 @@ function parseJson(raw) {
 
 /**
  * @typedef {{
- *   snapshotId?: string;
- *   workDir?: string;
+ *   repoName: string;
+ *   branchRef: string;
  *   commands: string[];
  *   commandTimeoutMs: number;
  * }} JobInput
@@ -134,38 +161,113 @@ function validateAndNormalize(raw) {
   }
   if (
     "commandTimeoutMs" in raw &&
-    (typeof raw.commandTimeoutMs !== "number" ||
-      !Number.isFinite(raw.commandTimeoutMs) ||
-      raw.commandTimeoutMs <= 0)
+    (typeof raw.commandTimeoutMs !== "number" || !Number.isFinite(raw.commandTimeoutMs) || raw.commandTimeoutMs <= 0)
   ) {
     return { ok: false, reason: "commandTimeoutMs must be a positive number" };
   }
 
-  const str = (v) =>
-    typeof v === "string" && v.trim() !== "" ? v.trim() : undefined;
+  const str = (v) => typeof v === "string" && v.trim() !== "" ? v.trim() : undefined;
 
-  const snapshotId = str(raw.snapshotId);
-  const workDir = str(raw.workDir);
+  const repoName = str(raw.repoName);
+  const branchRef = str(raw.branchRef);
 
   const commands = Array.isArray(raw.commands)
     ? raw.commands.filter((c) => typeof c === "string" && c.trim()).map((c) => c.trim())
     : [];
 
   const commandTimeoutMs =
-    typeof raw.commandTimeoutMs === "number" &&
-    Number.isFinite(raw.commandTimeoutMs) &&
-    raw.commandTimeoutMs > 0
+    typeof raw.commandTimeoutMs === "number" && Number.isFinite(raw.commandTimeoutMs) && raw.commandTimeoutMs > 0
       ? Math.floor(raw.commandTimeoutMs)
       : DEFAULT_TIMEOUT_MS;
 
-  if (!snapshotId && !workDir) {
-    return { ok: false, reason: "Either snapshotId or workDir is required" };
-  }
-  if (commands.length === 0) {
-    return { ok: false, reason: "commands must be a non-empty array" };
-  }
+  if (!repoName) return { ok: false, reason: "repoName is required" };
+  if (!branchRef) return { ok: false, reason: "branchRef is required" };
+  if (commands.length === 0) return { ok: false, reason: "commands must be a non-empty array" };
 
-  return { ok: true, input: { snapshotId, workDir, commands, commandTimeoutMs } };
+  return { ok: true, input: { repoName, branchRef, commands, commandTimeoutMs } };
+}
+
+// ---------------------------------------------------------------------------
+// Git — fetch feature branch and merge into beta snapshot
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the authenticated remote URL without logging credentials.
+ * @returns {string}
+ */
+function buildGitRemoteUrl() {
+  if (!GIT_REPO_URL) throw new Error("GIT_REPO_URL is not set");
+  if (!GIT_READ_TOKEN) throw new Error("GIT_READ_TOKEN is not set");
+
+  // Insert credentials into the URL: https://user:token@host/path
+  const url = new URL(GIT_REPO_URL.startsWith("http") ? GIT_REPO_URL : `https://${GIT_REPO_URL}`);
+  url.username = GIT_READ_USERNAME || "x-token-auth";
+  url.password = GIT_READ_TOKEN;
+  return url.toString();
+}
+
+/**
+ * Fetch the feature branch into workDir and merge it.
+ * Returns whether pnpm-lock.yaml changed so the caller can decide to run install.
+ *
+ * @param {string} workDir
+ * @param {string} branchRef
+ * @returns {Promise<{ lockfileChanged: boolean }>}
+ */
+async function fetchAndMerge(workDir, branchRef) {
+  const remoteUrl = buildGitRemoteUrl();
+  const gitEnv = { ...COMMAND_ENV, GIT_TERMINAL_PROMPT: "0" };
+
+  // Fetch only the tip of the target branch — shallow to minimise data transfer.
+  await execFile(
+    "git",
+    ["fetch", "--depth=1", remoteUrl, branchRef],
+    { cwd: workDir, timeout: GIT_FETCH_TIMEOUT_MS, env: gitEnv },
+  );
+
+  // Check whether the lockfile is changing before we merge.
+  // Two-dot diff compares trees directly — works even with shallow clones that
+  // have no common ancestor.
+  const { stdout: diffNames } = await execFile(
+    "git",
+    ["diff", "--name-only", "HEAD", "FETCH_HEAD"],
+    { cwd: workDir, env: gitEnv },
+  );
+  const lockfileChanged = diffNames.split("\n").some((f) => f.trim() === "pnpm-lock.yaml");
+
+  // Merge the fetched branch into the working tree without committing.
+  // --allow-unrelated-histories handles shallow clone snapshots from Jenkins.
+  // --no-commit leaves the tree in a merged state so commands run against real content.
+  await execFile(
+    "git",
+    ["merge", "--no-commit", "--no-edit", "--allow-unrelated-histories", "FETCH_HEAD"],
+    { cwd: workDir, env: gitEnv },
+  );
+
+  return { lockfileChanged };
+}
+
+// ---------------------------------------------------------------------------
+// pnpm install (only when lockfile changed)
+// ---------------------------------------------------------------------------
+
+async function runPnpmInstall(workDir, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    exec(
+      "pnpm install --frozen-lockfile --prefer-offline",
+      {
+        cwd: workDir,
+        timeout: timeoutMs,
+        killSignal: "SIGKILL",
+        maxBuffer: 10 * 1024 * 1024,
+        env: { ...COMMAND_ENV, NODE_ENV: "test", CI: "true" },
+      },
+      (error, stdout, stderr) => {
+        if (error) reject(Object.assign(error, { stdout, stderr }));
+        else resolve({ stdout, stderr });
+      },
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -175,8 +277,7 @@ function validateAndNormalize(raw) {
 function truncate(str, limit = MAX_OUTPUT_BYTES) {
   if (typeof str !== "string") return "";
   if (Buffer.byteLength(str) <= limit) return str;
-  const buf = Buffer.from(str);
-  return buf.subarray(0, limit).toString("utf8") + "\n…[truncated]";
+  return Buffer.from(str).subarray(0, limit).toString("utf8") + "\n…[truncated]";
 }
 
 /** Run commands sequentially. Stops on first failure. */
@@ -209,7 +310,6 @@ async function runCommands(workDir, commands, timeoutMs) {
         },
       );
     });
-
     results.push(result);
     if (!result.success) break;
   }
@@ -226,48 +326,67 @@ function stamp(job, patch) {
 
 function toResponse(job) {
   return {
-    jobId: job.jobId,
-    status: job.status,
-    stage: job.stage,
-    createdAt: job.createdAt,
-    updatedAt: job.updatedAt,
-    workDir: job.workDir ?? null,
-    snapshotId: job.snapshotId ?? null,
+    jobId:          job.jobId,
+    status:         job.status,
+    stage:          job.stage,
+    createdAt:      job.createdAt,
+    updatedAt:      job.updatedAt,
+    snapshotId:     job.snapshotId ?? null,
     commandResults: job.commandResults ?? [],
-    error: job.error ?? null,
+    error:          job.error ?? null,
   };
 }
 
 async function executeJob(job) {
-  const { snapshotId, commands, commandTimeoutMs } =
-    /** @type {JobInput} */ (job.input);
-  let workDir = /** @type {string} */ (job.input.workDir) || "";
-  let pulledWorkDir = false;
+  const { repoName, branchRef, commands, commandTimeoutMs } = /** @type {JobInput} */ (job.input);
+  let workDir = "";
+  let snapshotId = undefined;
 
   try {
-    // --- pull snapshot ---
+    // --- 1. Pull beta snapshot from GCS ---
     stamp(job, { status: "running", stage: "pull" });
-    console.log(`[JOB ${job.jobId}] starting | snapshot: ${snapshotId || "none"} | commands: ${commands.length}`);
-    if (snapshotId) {
+    console.log(`[JOB ${job.jobId}] starting | repo: ${repoName} | branch: ${branchRef} | commands: ${commands.length}`);
+
+    try {
+      snapshotId = await resolveSnapshotId({ repoName });
+      console.log(`[JOB ${job.jobId}] resolved snapshot: ${snapshotId}. pulling...`);
+      workDir = await pullSnapshot(snapshotId);
+      console.log(`[JOB ${job.jobId}] pull complete -> ${workDir}`);
+    } catch (err) {
+      stamp(job, { status: "failed", stage: "pull", error: { code: E.PULL_FAILED, message: errMsg(err) } });
+      return;
+    }
+    stamp(job, { snapshotId: snapshotId ?? null });
+
+    // --- 2. Fetch feature branch and merge ---
+    stamp(job, { stage: "fetch" });
+    console.log(`[JOB ${job.jobId}] fetching branch: ${branchRef}`);
+
+    let lockfileChanged = false;
+    try {
+      ({ lockfileChanged } = await fetchAndMerge(workDir, branchRef));
+      console.log(`[JOB ${job.jobId}] merge complete | lockfile changed: ${lockfileChanged}`);
+    } catch (err) {
+      stamp(job, { status: "failed", stage: "fetch", error: { code: E.FETCH_FAILED, message: errMsg(err) } });
+      return;
+    }
+
+    // --- 3. Install dependencies only if lockfile changed ---
+    if (lockfileChanged) {
+      stamp(job, { stage: "install" });
+      console.log(`[JOB ${job.jobId}] pnpm-lock.yaml changed — running pnpm install`);
       try {
-        console.log(`[JOB ${job.jobId}] pulling snapshot...`);
-        workDir = await pullSnapshot(snapshotId);
-        console.log(`[JOB ${job.jobId}] pull complete → ${workDir}`);
-        pulledWorkDir = true;
+        await runPnpmInstall(workDir, commandTimeoutMs);
+        console.log(`[JOB ${job.jobId}] install complete`);
       } catch (err) {
-        stamp(job, {
-          status: "failed",
-          stage: "pull",
-          error: { code: E.PULL_FAILED, message: errMsg(err) },
-        });
+        stamp(job, { status: "failed", stage: "install", error: { code: E.INSTALL_FAILED, message: errMsg(err) } });
         return;
       }
     }
-    stamp(job, { workDir, snapshotId });
 
-    // --- run commands ---
+    // --- 4. Run commands ---
     stamp(job, { stage: "command" });
-    console.log(`[JOB ${job.jobId}] running ${commands.length} command(s) in ${workDir}`);
+    console.log(`[JOB ${job.jobId}] running ${commands.length} command(s)`);
     const results = await runCommands(workDir, commands, commandTimeoutMs);
     stamp(job, { commandResults: results });
 
@@ -283,15 +402,11 @@ async function executeJob(job) {
 
     console.log(`[JOB ${job.jobId}] completed`);
     stamp(job, { status: "completed", stage: "done" });
+
   } catch (err) {
-    stamp(job, {
-      status: "failed",
-      stage: "internal",
-      error: { code: E.INTERNAL, message: errMsg(err) },
-    });
+    stamp(job, { status: "failed", stage: "internal", error: { code: E.INTERNAL, message: errMsg(err) } });
   } finally {
-    // Clean up pulled snapshot directory.
-    if (pulledWorkDir && workDir) {
+    if (workDir) {
       try { await fs.rm(workDir, { recursive: true, force: true }); } catch { /* best effort */ }
     }
   }
@@ -317,7 +432,7 @@ async function drainQueue() {
 }
 
 // ---------------------------------------------------------------------------
-// Job cleanup (in-memory records)
+// Job cleanup
 // ---------------------------------------------------------------------------
 
 function cleanup() {
@@ -336,9 +451,7 @@ function cleanup() {
 
   if (jobs.size > MAX_JOBS) {
     stale.sort((a, b) => a[1] - b[1]);
-    while (jobs.size > MAX_JOBS && stale.length > 0) {
-      jobs.delete(stale.shift()[0]);
-    }
+    while (jobs.size > MAX_JOBS && stale.length > 0) jobs.delete(stale.shift()[0]);
   }
 }
 
@@ -359,14 +472,11 @@ const server = http.createServer(async (req, res) => {
   // --- poll job ---
   if (req.method === "GET") {
     const m = req.url && JOB_ID_RE.exec(req.url);
-    if (!m) {
-      console.log(`[GET] 404 — no match for url: ${req.url}`);
-      res.writeHead(404); return res.end("Not found");
-    }
+    if (!m) { res.writeHead(404); return res.end("Not found"); }
     const jobId = decodeURIComponent(m[1]);
     const job = jobs.get(jobId);
     if (!job) {
-      console.log(`[GET] 404 — job not found: ${jobId} | total jobs in store: ${jobs.size} | ids: [${[...jobs.keys()].join(", ")}]`);
+      console.log(`[GET] 404 — job not found: ${jobId}`);
       return json(res, 404, { error: "Job not found" });
     }
     console.log(`[GET] 200 — job: ${jobId} | status: ${job.status} | stage: ${job.stage}`);
@@ -375,8 +485,7 @@ const server = http.createServer(async (req, res) => {
 
   // --- submit job ---
   if (req.method !== "POST" || req.url !== "/run-checks") {
-    res.writeHead(404);
-    return res.end("Not found");
+    res.writeHead(404); return res.end("Not found");
   }
 
   let body;
@@ -394,19 +503,11 @@ const server = http.createServer(async (req, res) => {
 
   const jobId = crypto.randomUUID();
   const now = new Date().toISOString();
-  const job = {
-    jobId,
-    status: "queued",
-    stage: "queued",
-    createdAt: now,
-    updatedAt: now,
-    input: v.input,
-    commandResults: [],
-  };
+  const job = { jobId, status: "queued", stage: "queued", createdAt: now, updatedAt: now, input: v.input, commandResults: [] };
 
   jobs.set(jobId, job);
   queue.push(jobId);
-  console.log(`[POST] 202 — queued job: ${jobId} | commands: ${v.input.commands.length} | snapshot: ${v.input.snapshotId || "none"}`);
+  console.log(`[POST] 202 -> queued job: ${jobId} | branch: ${v.input.branchRef} | repo: ${v.input.repoName}`);
   void drainQueue();
 
   return json(res, 202, { jobId, status: "queued" });
