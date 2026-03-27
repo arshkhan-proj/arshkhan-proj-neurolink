@@ -23,9 +23,8 @@ const MAX_BODY_BYTES = 1 * 1024 * 1024;
 const MAX_OUTPUT_BYTES = 100 * 1024;
 
 // Git credentials for fetching feature branches — never passed to user commands.
-const GIT_REPO_URL = process.env.GIT_REPO_URL || "";           // e.g. https://bitbucket.juspay.net/scm/bz/lighthouse.git
-const GIT_READ_USERNAME = process.env.GIT_READ_USERNAME || ""; // e.g. titan.a@juspay.in
-const GIT_READ_TOKEN = process.env.GIT_READ_TOKEN || "";       // bearer token from k8s secret
+const GIT_REPO_URL = process.env.GIT_REPO_URL || "";   // e.g. https://bitbucket.juspay.net/scm/bz/lighthouse.git
+const GIT_READ_TOKEN = process.env.GIT_READ_TOKEN || ""; // Bitbucket HTTP Access Token
 
 // Env vars that commands are allowed to see.
 // Git creds, JWT secret, and cloud credentials never reach subprocesses.
@@ -193,21 +192,6 @@ function validateAndNormalize(raw) {
 // ---------------------------------------------------------------------------
 
 /**
- * Build the authenticated remote URL without logging credentials.
- * @returns {string}
- */
-function buildGitRemoteUrl() {
-  if (!GIT_REPO_URL) throw new Error("GIT_REPO_URL is not set");
-  if (!GIT_READ_TOKEN) throw new Error("GIT_READ_TOKEN is not set");
-
-  // Insert credentials into the URL: https://user:token@host/path
-  const url = new URL(GIT_REPO_URL.startsWith("http") ? GIT_REPO_URL : `https://${GIT_REPO_URL}`);
-  url.username = GIT_READ_USERNAME || "x-token-auth";
-  url.password = GIT_READ_TOKEN;
-  return url.toString();
-}
-
-/**
  * Fetch the feature branch into workDir and merge it.
  * Returns whether pnpm-lock.yaml changed so the caller can decide to run install.
  *
@@ -216,13 +200,17 @@ function buildGitRemoteUrl() {
  * @returns {Promise<{ lockfileChanged: boolean }>}
  */
 async function fetchAndMerge(workDir, branchRef) {
-  const remoteUrl = buildGitRemoteUrl();
+  if (!GIT_REPO_URL) throw new Error("GIT_REPO_URL is not set");
+  if (!GIT_READ_TOKEN) throw new Error("GIT_READ_TOKEN is not set");
+
+  // Use Bearer header auth — avoids URL-encoding issues with tokens containing special chars.
+  const authHeader = `Authorization: Bearer ${GIT_READ_TOKEN}`;
   const gitEnv = { ...COMMAND_ENV, GIT_TERMINAL_PROMPT: "0" };
 
   // Fetch only the tip of the target branch — shallow to minimise data transfer.
   await execFile(
     "git",
-    ["fetch", "--depth=1", remoteUrl, branchRef],
+    ["-c", `http.extraHeader=${authHeader}`, "fetch", "--depth=1", GIT_REPO_URL, branchRef],
     { cwd: workDir, timeout: GIT_FETCH_TIMEOUT_MS, env: gitEnv },
   );
 
