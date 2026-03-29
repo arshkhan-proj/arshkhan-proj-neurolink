@@ -1,13 +1,11 @@
 import http from "node:http";
-import { exec, execFile as execFileCb } from "node:child_process";
+import { exec } from "node:child_process";
 import { promises as fs } from "node:fs";
 import crypto from "node:crypto";
 import { promisify } from "node:util";
 import path from "node:path";
 import { pullSnapshot } from "./pullSnapshot.js";
-import { resolveSnapshotId } from "./snapshotStorage.js";
-
-const execFile = promisify(execFileCb);
+import { resolveSnapshotId, resolveDiffId, pullDiff } from "./snapshotStorage.js";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -18,25 +16,15 @@ const JOB_TTL_MS = Number(process.env.CHECK_RUNNER_JOB_TTL_MS || 3_600_000);
 const CLEANUP_INTERVAL_MS = Number(process.env.CHECK_RUNNER_JOB_CLEANUP_INTERVAL_MS || 60_000);
 const MAX_JOBS = Number(process.env.CHECK_RUNNER_MAX_JOBS || 500);
 const DEFAULT_TIMEOUT_MS = Number(process.env.CHECK_RUNNER_COMMAND_TIMEOUT_MS || 600_000);
-const GIT_FETCH_TIMEOUT_MS = Number(process.env.CHECK_RUNNER_GIT_FETCH_TIMEOUT_MS || 60_000);
 const MAX_BODY_BYTES = 1 * 1024 * 1024;
 const MAX_OUTPUT_BYTES = 100 * 1024;
 
-// Git credentials for fetching feature branches — never passed to user commands.
-const GIT_REPO_URL = process.env.GIT_REPO_URL || "";   // e.g. https://bitbucket.juspay.net/scm/bz/lighthouse.git
-const GIT_READ_TOKEN = process.env.GIT_READ_TOKEN || ""; // Bitbucket HTTP Access Token
-
 // Env vars that commands are allowed to see.
-// Git creds, JWT secret, and cloud credentials never reach subprocesses.
+// JWT secret and cloud credentials never reach subprocesses.
 const COMMAND_ENV = Object.fromEntries(
   [
     "PATH", "HOME", "USER", "SHELL", "LANG", "TERM", "TMPDIR",
     "NODE_VERSION", "HOSTNAME", "npm_config_cache", "PNPM_HOME", "COREPACK_HOME",
-    // Network/proxy/SSL — required for git to reach internal hosts like Bitbucket.
-    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-    "http_proxy", "https_proxy", "no_proxy",
-    "SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_SSL_CAINFO", "GIT_SSL_CAPATH",
-    "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
   ]
     .filter((k) => process.env[k] !== undefined)
     .map((k) => [k, process.env[k]]),
@@ -50,7 +38,7 @@ const E = {
   BAD_REQUEST:     "BAD_REQUEST",
   BAD_JSON:        "BAD_JSON",
   PULL_FAILED:     "PULL_FAILED",
-  FETCH_FAILED:    "FETCH_FAILED",
+  OVERLAY_FAILED:  "OVERLAY_FAILED",
   INSTALL_FAILED:  "INSTALL_FAILED",
   COMMAND_FAILED:  "COMMAND_FAILED",
   COMMAND_TIMEOUT: "COMMAND_TIMEOUT",
@@ -193,60 +181,64 @@ function validateAndNormalize(raw) {
 }
 
 // ---------------------------------------------------------------------------
-// Git — fetch feature branch and merge into beta snapshot
+// Diff overlay — extract diff tarball over beta snapshot
 // ---------------------------------------------------------------------------
 
 /**
- * Fetch the feature branch into workDir and merge it.
- * Returns whether pnpm-lock.yaml changed so the caller can decide to run install.
+ * Apply a diff overlay onto the beta snapshot working directory.
+ * The diff tarball contains changed/added files and optionally a
+ * `.neurolink-deleted` manifest listing files removed in the branch.
  *
- * @param {string} workDir
- * @param {string} branchRef
+ * @param {string} workDir  - extracted beta snapshot path
+ * @param {string} diffPath - path to the extracted diff tarball directory
  * @returns {Promise<{ lockfileChanged: boolean }>}
  */
-async function fetchAndMerge(workDir, branchRef) {
-  if (!GIT_REPO_URL) throw new Error("GIT_REPO_URL is not set");
-  if (!GIT_READ_TOKEN) throw new Error("GIT_READ_TOKEN is not set");
+async function applyDiffOverlay(workDir, diffPath) {
+  const deletedManifest = path.join(diffPath, ".neurolink-deleted");
+  let lockfileChanged = false;
 
-  // Use Bearer header auth — avoids URL-encoding issues with tokens containing special chars.
-  const authHeader = `Authorization: Bearer ${GIT_READ_TOKEN}`;
-  const gitEnv = { ...COMMAND_ENV, GIT_TERMINAL_PROMPT: "0" };
-
-  // Fetch only the tip of the target branch — shallow to minimise data transfer.
-  await execFile(
-    "git",
-    ["-c", `http.extraHeader=${authHeader}`, "fetch", "--depth=1", GIT_REPO_URL, branchRef],
-    { cwd: workDir, timeout: GIT_FETCH_TIMEOUT_MS, env: gitEnv },
-  );
-
-  // Detect changed files — two-dot diff compares trees directly, no merge base needed.
-  const { stdout: diffNames } = await execFile(
-    "git",
-    ["diff", "--name-only", "HEAD", "FETCH_HEAD"],
-    { cwd: workDir, env: gitEnv },
-  );
-  const lockfileChanged = diffNames.split("\n").some((f) => f.trim() === "pnpm-lock.yaml");
-
-  // Delete files removed in the feature branch before overlaying.
-  const { stdout: deletedNames } = await execFile(
-    "git",
-    ["diff", "--name-only", "--diff-filter=D", "HEAD", "FETCH_HEAD"],
-    { cwd: workDir, env: gitEnv },
-  );
-  const deleted = deletedNames.split("\n").map((f) => f.trim()).filter(Boolean);
-  for (const f of deleted) {
-    await fs.rm(path.join(workDir, f), { force: true });
+  // Delete files listed in the manifest (if present).
+  try {
+    const content = await fs.readFile(deletedManifest, "utf8");
+    const deleted = content.split("\n").map((f) => f.trim()).filter(Boolean);
+    for (const f of deleted) {
+      await fs.rm(path.join(workDir, f), { force: true });
+    }
+    // Remove the manifest so it doesn't end up in the working tree.
+    await fs.rm(deletedManifest, { force: true });
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+    // No manifest — no deletions.
   }
 
-  // Overlay feature branch files directly onto the beta working tree.
-  // No merge, no conflicts — just takes feature branch file state as-is.
-  await execFile(
-    "git",
-    ["checkout", "FETCH_HEAD", "--", "."],
-    { cwd: workDir, env: gitEnv },
-  );
+  // Copy all diff files over the snapshot.
+  await copyDir(diffPath, workDir);
+
+  // Check if lockfile was part of the diff.
+  try {
+    await fs.access(path.join(diffPath, "pnpm-lock.yaml"));
+    lockfileChanged = true;
+  } catch { /* not in diff */ }
 
   return { lockfileChanged };
+}
+
+/**
+ * Recursively copy src directory contents into dest, overwriting existing files.
+ */
+async function copyDir(src, dest) {
+  const entries = await fs.readdir(src, { withFileTypes: true });
+  for (const entry of entries) {
+    const srcPath = path.join(src, entry.name);
+    const destPath = path.join(dest, entry.name);
+    if (entry.isDirectory()) {
+      await fs.mkdir(destPath, { recursive: true });
+      await copyDir(srcPath, destPath);
+    } else {
+      await fs.mkdir(path.dirname(destPath), { recursive: true });
+      await fs.copyFile(srcPath, destPath);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +334,7 @@ function toResponse(job) {
 async function executeJob(job) {
   const { repoName, branchRef, commands, commandTimeoutMs } = /** @type {JobInput} */ (job.input);
   let workDir = "";
+  let diffDir = "";
   let snapshotId = undefined;
 
   try {
@@ -360,30 +353,30 @@ async function executeJob(job) {
     }
     stamp(job, { snapshotId: snapshotId ?? null });
 
-    // --- 2. Fetch feature branch and merge ---
-    stamp(job, { stage: "fetch" });
-    console.log(`[JOB ${job.jobId}] fetching branch: ${branchRef}`);
+    // --- 2. Pull diff overlay from GCS and apply ---
+    stamp(job, { stage: "overlay" });
+    console.log(`[JOB ${job.jobId}] pulling diff overlay for branch: ${branchRef}`);
 
-    let lockfileChanged = false;
     try {
-      ({ lockfileChanged } = await fetchAndMerge(workDir, branchRef));
-      console.log(`[JOB ${job.jobId}] merge complete | lockfile changed: ${lockfileChanged}`);
+      const diffId = await resolveDiffId({ repoName, branchRef });
+      console.log(`[JOB ${job.jobId}] resolved diff: ${diffId}. pulling...`);
+      diffDir = await pullDiff(diffId);
+      await applyDiffOverlay(workDir, diffDir);
+      console.log(`[JOB ${job.jobId}] overlay applied`);
     } catch (err) {
-      stamp(job, { status: "failed", stage: "fetch", error: { code: E.FETCH_FAILED, message: errMsg(err) } });
+      stamp(job, { status: "failed", stage: "overlay", error: { code: E.OVERLAY_FAILED, message: errMsg(err) } });
       return;
     }
 
-    // --- 3. Install dependencies only if lockfile changed ---
-    if (lockfileChanged) {
-      stamp(job, { stage: "install" });
-      console.log(`[JOB ${job.jobId}] pnpm-lock.yaml changed — running pnpm install`);
-      try {
-        await runPnpmInstall(workDir, commandTimeoutMs);
-        console.log(`[JOB ${job.jobId}] install complete`);
-      } catch (err) {
-        stamp(job, { status: "failed", stage: "install", error: { code: E.INSTALL_FAILED, message: errMsg(err) } });
-        return;
-      }
+    // --- 3. Install dependencies ---
+    stamp(job, { stage: "install" });
+    console.log(`[JOB ${job.jobId}] running pnpm install`);
+    try {
+      await runPnpmInstall(workDir, commandTimeoutMs);
+      console.log(`[JOB ${job.jobId}] install complete`);
+    } catch (err) {
+      stamp(job, { status: "failed", stage: "install", error: { code: E.INSTALL_FAILED, message: errMsg(err) } });
+      return;
     }
 
     // --- 4. Run commands ---
@@ -410,6 +403,9 @@ async function executeJob(job) {
   } finally {
     if (workDir) {
       try { await fs.rm(workDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
+    if (diffDir) {
+      try { await fs.rm(diffDir, { recursive: true, force: true }); } catch { /* best effort */ }
     }
   }
 }
@@ -469,34 +465,6 @@ const JOB_ID_RE = /^\/run-checks\/([^/]+)$/;
 const server = http.createServer(async (req, res) => {
   if (!isAuthorized(req)) {
     return json(res, 401, { code: E.UNAUTHORIZED, error: "Invalid or missing credentials" });
-  }
-
-  // --- temporary debug endpoint (remove after testing) ---
-  if (req.method === "GET" && req.url === "/run-checks/debug") {
-    const results = {};
-    try { results.gitVersion = (await execFile("git", ["--version"])).stdout.trim(); } catch (e) { results.gitVersion = errMsg(e); }
-    results.GIT_REPO_URL = GIT_REPO_URL || "(not set)";
-    results.GIT_READ_TOKEN_length = GIT_READ_TOKEN.length;
-    results.GIT_READ_TOKEN_prefix = GIT_READ_TOKEN.slice(0, 10) + "...";
-    results.GIT_READ_TOKEN_suffix = "..." + GIT_READ_TOKEN.slice(-5);
-
-    // Test 1: http.extraHeader with Bearer
-    try {
-      const authHeader = `Authorization: Bearer ${GIT_READ_TOKEN}`;
-      const { stdout } = await execFile("git", ["-c", `http.extraHeader=${authHeader}`, "ls-remote", GIT_REPO_URL, "HEAD"], { timeout: 15000, env: { ...COMMAND_ENV, GIT_TERMINAL_PROMPT: "0" } });
-      results.bearerTest = { success: true, output: stdout.trim() };
-    } catch (e) { results.bearerTest = { success: false, error: e.stderr || errMsg(e) }; }
-
-    // Test 2: URL-embedded creds (URL-encoded)
-    try {
-      const u = new URL(GIT_REPO_URL.startsWith("http") ? GIT_REPO_URL : `https://${GIT_REPO_URL}`);
-      u.username = "x-token-auth";
-      u.password = GIT_READ_TOKEN;
-      const { stdout } = await execFile("git", ["ls-remote", u.toString(), "HEAD"], { timeout: 15000, env: { ...COMMAND_ENV, GIT_TERMINAL_PROMPT: "0" } });
-      results.urlCredsTest = { success: true, output: stdout.trim() };
-    } catch (e) { results.urlCredsTest = { success: false, error: e.stderr || errMsg(e) }; }
-
-    return json(res, 200, results);
   }
 
   // --- poll job ---
