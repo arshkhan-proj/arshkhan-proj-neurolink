@@ -21,14 +21,18 @@ const MAX_OUTPUT_BYTES = 100 * 1024;
 
 // Env vars that commands are allowed to see.
 // JWT secret and cloud credentials never reach subprocesses.
-const COMMAND_ENV = Object.fromEntries(
-  [
-    "PATH", "HOME", "USER", "SHELL", "LANG", "TERM", "TMPDIR",
-    "NODE_VERSION", "HOSTNAME", "npm_config_cache", "PNPM_HOME", "COREPACK_HOME",
-  ]
-    .filter((k) => process.env[k] !== undefined)
-    .map((k) => [k, process.env[k]]),
-);
+// NODE_OPTIONS is forced to cap memory — lighthouse scripts request 8GB but the pod only has 4GB.
+const COMMAND_ENV = {
+  ...Object.fromEntries(
+    [
+      "PATH", "HOME", "USER", "SHELL", "LANG", "TERM", "TMPDIR",
+      "NODE_VERSION", "HOSTNAME", "npm_config_cache", "PNPM_HOME", "COREPACK_HOME",
+    ]
+      .filter((k) => process.env[k] !== undefined)
+      .map((k) => [k, process.env[k]]),
+  ),
+  NODE_OPTIONS: `--max-old-space-size=${process.env.CHECK_RUNNER_NODE_MAX_MEM_MB || "2048"}`,
+};
 
 // ---------------------------------------------------------------------------
 // Error codes
