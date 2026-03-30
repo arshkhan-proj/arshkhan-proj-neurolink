@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import { promisify } from "node:util";
 import path from "node:path";
 import { pullSnapshot } from "./pullSnapshot.js";
-import { resolveSnapshotId, resolveDiffId, pullDiff } from "./snapshotStorage.js";
+import { resolveDiffId, pullDiff } from "./snapshotStorage.js";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -343,10 +343,8 @@ async function executeJob(job) {
     console.log(`[JOB ${job.jobId}] starting | repo: ${repoName} | branch: ${branchRef} | commands: ${commands.length}`);
 
     try {
-      snapshotId = await resolveSnapshotId({ repoName });
-      console.log(`[JOB ${job.jobId}] resolved snapshot: ${snapshotId}. pulling...`);
-      workDir = await pullSnapshot(snapshotId);
-      console.log(`[JOB ${job.jobId}] pull complete -> ${workDir}`);
+      ({ workDir, snapshotId } = await pullSnapshot(repoName));
+      console.log(`[JOB ${job.jobId}] pull complete: ${snapshotId} -> ${workDir}`);
     } catch (err) {
       stamp(job, { status: "failed", stage: "pull", error: { code: E.PULL_FAILED, message: errMsg(err) } });
       return;

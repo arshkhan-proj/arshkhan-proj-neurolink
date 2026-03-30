@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { execFile as execFileCb } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
-import { storageKey, gcs, bucketName } from "./snapshotStorage.js";
+import { storageKey, gcs, bucketName, resolveSnapshotId } from "./snapshotStorage.js";
 
 const pipe = promisify(pipeline);
 const execFile = promisify(execFileCb);
@@ -25,15 +25,17 @@ function withTimeout(promise, ms, label) {
 }
 
 /**
- * Download and extract a snapshot tarball from GCS.
+ * Download and extract the latest snapshot for a repo from GCS.
  *
- * @param {string} snapshotId  e.g. "lighthouse-snapshot-abc123.tar.gz"
- * @returns {Promise<string>} absolute path to the extracted directory
+ * @param {string} repoName  e.g. "lighthouse"
+ * @returns {Promise<{ workDir: string; snapshotId: string }>}
  */
-export async function pullSnapshot(snapshotId) {
-  if (!snapshotId || typeof snapshotId !== "string") {
-    throw new Error("snapshotId must be a non-empty string");
+export async function pullSnapshot(repoName) {
+  if (!repoName || typeof repoName !== "string") {
+    throw new Error("repoName must be a non-empty string");
   }
+
+  const snapshotId = await resolveSnapshotId({ repoName });
 
   mkdirSync(SNAPSHOT_ROOT, { recursive: true });
 
@@ -56,5 +58,5 @@ export async function pullSnapshot(snapshotId) {
     try { await fs.unlink(archivePath); } catch { /* best effort */ }
   }
 
-  return snapshotDir;
+  return { workDir: snapshotDir, snapshotId };
 }

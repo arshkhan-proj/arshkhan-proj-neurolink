@@ -66,37 +66,28 @@ export function diffsPrefix() {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve the latest beta snapshot id for a given repo.
+ * Resolve the snapshot id for a given repo.
  *
- * Naming convention: {repoName}-snapshot-{commitHash}.tar.gz
- * Always picks the most recently uploaded one.
+ * Naming convention: {repoName}-snapshot-latest.tar.gz
+ * A single snapshot per repo, overwritten on every beta build.
  *
  * @param {{ repoName: string }} params
- * @returns {Promise<string>} snapshotId e.g. "lighthouse-snapshot-abc123.tar.gz"
+ * @returns {Promise<string>} snapshotId e.g. "lighthouse-snapshot-latest.tar.gz"
  */
 export async function resolveSnapshotId({ repoName }) {
   if (!repoName || typeof repoName !== "string" || repoName.trim() === "") {
     throw new Error("repoName is required");
   }
 
-  const prefix = snapshotsPrefix();
-  const namePrefix = `${prefix}${repoName.trim()}-snapshot-`;
+  const snapshotId = `${repoName.trim()}-snapshot-latest.tar.gz`;
+  const key = storageKey(snapshotId);
 
-  const [files] = await gcs().bucket(bucketName()).getFiles({ prefix: namePrefix });
-  const candidates = files.filter((f) => f.name.endsWith(".tar.gz"));
-
-  if (candidates.length === 0) {
-    throw new Error(`No snapshots found for repo '${repoName}'`);
+  const [exists] = await gcs().bucket(bucketName()).file(key).exists();
+  if (!exists) {
+    throw new Error(`No snapshot found for repo '${repoName}' (expected key: ${key})`);
   }
 
-  // Pick the most recently uploaded snapshot.
-  const sorted = [...candidates].sort((a, b) => {
-    const at = Date.parse(a.metadata?.updated || a.metadata?.timeCreated || "0");
-    const bt = Date.parse(b.metadata?.updated || b.metadata?.timeCreated || "0");
-    return bt - at;
-  });
-
-  return sorted[0].name.slice(prefix.length);
+  return snapshotId;
 }
 
 // ---------------------------------------------------------------------------
