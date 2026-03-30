@@ -27,6 +27,7 @@ const COMMAND_ENV = {
     [
       "PATH", "HOME", "USER", "SHELL", "LANG", "TERM", "TMPDIR",
       "NODE_VERSION", "HOSTNAME", "npm_config_cache", "PNPM_HOME", "COREPACK_HOME",
+      "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD",
     ]
       .filter((k) => process.env[k] !== undefined)
       .map((k) => [k, process.env[k]]),
@@ -229,6 +230,7 @@ async function applyDiffOverlay(workDir, diffPath) {
 
 /**
  * Recursively copy src directory contents into dest, overwriting existing files.
+ * Unlinks destination before copying to break hardlinks (protects cache base).
  */
 async function copyDir(src, dest) {
   const entries = await fs.readdir(src, { withFileTypes: true });
@@ -240,6 +242,7 @@ async function copyDir(src, dest) {
       await copyDir(srcPath, destPath);
     } else {
       await fs.mkdir(path.dirname(destPath), { recursive: true });
+      try { await fs.unlink(destPath); } catch { /* may not exist */ }
       await fs.copyFile(srcPath, destPath);
     }
   }
